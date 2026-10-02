@@ -113,6 +113,13 @@ class Handler(BaseHTTPRequestHandler):
         if fixture_id is not None:
             self.handle_get_fixture(fixture_id)
             return
+        if path == "/v1/snapshots":
+            self.handle_list_snapshots()
+            return
+        snapshot_id = _resource_id(path, "/v1/snapshots/")
+        if snapshot_id is not None:
+            self.handle_get_snapshot(snapshot_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_get_suite(self, suite_id: str) -> None:
@@ -150,6 +157,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_list_fixtures(self) -> None:
         self.send_json(200, self.service.list_fixtures())
+
+    def handle_get_snapshot(self, snapshot_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_snapshot(snapshot_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_list_snapshots(self) -> None:
+        self.send_json(200, self.service.list_snapshots())
 
     def handle_list_cases(self, query: str) -> None:
         try:
@@ -220,6 +236,13 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/v1/assertions/evaluate":
             self.handle_evaluate_assertions()
             return
+        if parts.path == "/v1/snapshots":
+            self.handle_create_snapshot()
+            return
+        snapshot_id = _subresource(parts.path, "/v1/snapshots/", "/compare")
+        if snapshot_id is not None:
+            self.handle_compare_snapshot(snapshot_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_create_suite(self) -> None:
@@ -258,6 +281,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, result)
 
+    def handle_create_snapshot(self) -> None:
+        try:
+            payload = self.read_body()
+            snapshot = self.service.create_snapshot(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, snapshot)
+
+    def handle_compare_snapshot(self, snapshot_id: str) -> None:
+        try:
+            payload = self.read_body()
+            result = self.service.compare_snapshot(snapshot_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, result)
+
     # -- DELETE ---------------------------------------------------------
 
     def do_DELETE(self) -> None:
@@ -274,6 +315,10 @@ class Handler(BaseHTTPRequestHandler):
         fixture_id = _resource_id(path, "/v1/fixtures/")
         if fixture_id is not None:
             self.handle_delete_fixture(fixture_id)
+            return
+        snapshot_id = _resource_id(path, "/v1/snapshots/")
+        if snapshot_id is not None:
+            self.handle_delete_snapshot(snapshot_id)
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
@@ -296,6 +341,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_delete_fixture(self, fixture_id: str) -> None:
         try:
             self.service.delete_fixture(fixture_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_no_content()
+
+    def handle_delete_snapshot(self, snapshot_id: str) -> None:
+        try:
+            self.service.delete_snapshot(snapshot_id)
         except ApiError as error:
             self.send_api_error(error)
             return
