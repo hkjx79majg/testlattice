@@ -8,8 +8,11 @@ on a threading server.
 from __future__ import annotations
 
 import copy
+import itertools
+import re
 import threading
 from collections.abc import Mapping
+from typing import TypeGuard
 
 from . import __version__
 
@@ -17,6 +20,16 @@ ALLOWED_KINDS = ("unit", "api", "browser", "contract")
 DEFAULT_TIMEOUT_SECONDS = 300
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 86400
+MAX_INSTANCES = 1000
+_AXIS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_scalar(value: object) -> TypeGuard[str | int | float | bool | None]:
+    """A permitted parameter value: string, number, boolean or null.
+
+    bool is a subclass of int, but it is still its own scalar kind here.
+    """
+    return value is None or isinstance(value, (str, int, float, bool))
 
 
 class ApiError(Exception):
@@ -47,6 +60,90 @@ def _reference(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise _validation(f"{field} must be a non-empty string")
     return value
+
+
+def _check_axis_name(name: object) -> str:
+    if not isinstance(name, str) or not _AXIS_NAME.fullmatch(name):
+        raise _validation(
+            f"parameter name {name!r} must match {_AXIS_NAME.pattern}"
+        )
+    return name
+
+
+def _check_scalar(value: object, location: str) -> object:
+    if not _is_scalar(value):
+        raise _validation(f"{location} must be a string, number, boolean or null")
+    return value
+
+
+def _validate_parameterization(raw: object) -> dict:
+    """Validate the optional parameterization block and return a detached copy.
+
+    Exactly one of ``axes``/``rows`` is allowed. The expanded instance count is
+    capped at ``MAX_INSTANCES``; duplicates are intentionally preserved.
+    """
+    if not isinstance(raw, dict):
+        raise _validation("parameterization must be a JSON object")
+    unknown = set(raw) - {"axes", "rows"}
+    if unknown:
+        raise _validation(
+            f"unknown fields in parameterization: {', '.join(sorted(unknown))}"
+        )
+    if "axes" in raw and "rows" in raw:
+        raise _validation("parameterization must use either axes or rows, not both")
+    if "axes" not in raw and "rows" not in raw:
+        raise _validation("parameterization must contain axes or rows")
+
+    if "axes" in raw:
+        axes = raw["axes"]
+        if not isinstance(axes, dict) or not axes:
+            raise _validation("parameterization.axes must be a non-empty object")
+        normalized_axes: dict[str, list] = {}
+        count = 1
+        for name, values in axes.items():
+            _check_axis_name(name)
+            if not isinstance(values, list) or not values:
+                raise _validation(f"parameterization.axes.{name} must be a non-empty array")
+            normalized: list = []
+            for index, value in enumerate(values):
+                normalized.append(_check_scalar(value, f"parameterization.axes.{name}[{index}]"))
+            normalized_axes[name] = normalized
+            count *= len(normalized)
+            if count > MAX_INSTANCES:
+                raise _validation(
+                    f"parameterization expands to more than {MAX_INSTANCES} instances"
+                )
+        return {"axes": normalized_axes}
+
+    rows = raw["rows"]
+    if not isinstance(rows, list) or not rows:
+        raise _validation("parameterization.rows must be a non-empty array")
+    names: list[str] | None = None
+    normalized_rows: list[dict[str, object]] = []
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, dict) or not row:
+            raise _validation(f"parameterization.rows[{row_index}] must be a non-empty object")
+        row_names: list[str] = []
+        for name in row:
+            _check_axis_name(name)
+            if name not in row_names:
+                row_names.append(name)
+        if names is None:
+            names = row_names
+        elif set(row_names) != set(names):
+            raise _validation(
+                "parameterization.rows must all have the same set of parameter names"
+            )
+        normalized_row = {
+            name: _check_scalar(row[name], f"parameterization.rows[{row_index}].{name}")
+            for name in names
+        }
+        normalized_rows.append(normalized_row)
+    if len(normalized_rows) > MAX_INSTANCES:
+        raise _validation(
+            f"parameterization expands to more than {MAX_INSTANCES} instances"
+        )
+    return {"rows": normalized_rows}
 
 
 class Service:
@@ -163,7 +260,17 @@ class Service:
     def _validate_case(self, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
-        allowed = {"id", "name", "suite_id", "kind", "steps", "tags", "enabled", "timeout_seconds"}
+        allowed = {
+            "id",
+            "name",
+            "suite_id",
+            "kind",
+            "steps",
+            "tags",
+            "enabled",
+            "timeout_seconds",
+            "parameterization",
+        }
         unknown = set(payload) - allowed
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
@@ -217,7 +324,11 @@ class Service:
                 )
             timeout = value
 
-        return {
+        parameterization: dict | None = None
+        if "parameterization" in payload and payload["parameterization"] is not None:
+            parameterization = _validate_parameterization(payload["parameterization"])
+
+        case = {
             "id": case_id,
             "name": name,
             "suite_id": suite_id,
@@ -227,6 +338,9 @@ class Service:
             "enabled": enabled,
             "timeout_seconds": timeout,
         }
+        if parameterization is not None:
+            case["parameterization"] = parameterization
+        return case
 
     def create_case(self, payload: object) -> dict:
         case = self._validate_case(payload)
@@ -244,6 +358,35 @@ class Service:
             if case is None:
                 raise ApiError(404, "case_not_found", f"case {case_id!r} not found")
             return copy.deepcopy(case)
+
+    def list_instances(self, case_id: str) -> dict:
+        """Expand a case's parameterization into stable, previewable instances.
+
+        A case without parameterization yields a single instance with empty
+        parameters. Expansion never mutates catalog state.
+        """
+        with self._lock:
+            case = self._cases.get(case_id)
+            if case is None:
+                raise ApiError(404, "case_not_found", f"case {case_id!r} not found")
+            parameterization = case.get("parameterization")
+            if parameterization is None:
+                parameters_rows: list[dict[str, object]] = [{}]
+            elif "axes" in parameterization:
+                axes = parameterization["axes"]
+                names = list(axes)
+                parameters_rows = [
+                    dict(zip(names, combo, strict=True))
+                    for combo in itertools.product(*(axes[name] for name in names))
+                ]
+            else:
+                parameters_rows = copy.deepcopy(parameterization["rows"])
+
+            instances = [
+                {"id": f"{case_id}[{index}]", "parameters": copy.deepcopy(parameters)}
+                for index, parameters in enumerate(parameters_rows)
+            ]
+            return {"case_id": case_id, "count": len(instances), "instances": instances}
 
     def list_cases(self, filters: Mapping[str, object]) -> list[dict]:
         suite_id = filters.get("suite_id")

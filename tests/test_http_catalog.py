@@ -231,6 +231,145 @@ class HttpTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(suites, [])
 
+    def test_parameterized_case_lifecycle(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            status, created = server.json(
+                "POST",
+                "/v1/cases",
+                case_payload(
+                    "c1",
+                    parameterization={"axes": {"browser": ["chrome", "firefox"], "n": [1, 2]}},
+                ),
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(
+                created["parameterization"],
+                {"axes": {"browser": ["chrome", "firefox"], "n": [1, 2]}},
+            )
+
+            status, fetched = server.json("GET", "/v1/cases/c1")
+            self.assertEqual(status, 200)
+            self.assertIn("parameterization", fetched)
+            status, cases = server.json("GET", "/v1/cases")
+            self.assertEqual(cases[0]["parameterization"], created["parameterization"])
+
+            status, preview = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(status, 200)
+            self.assertEqual(preview["case_id"], "c1")
+            self.assertEqual(preview["count"], 4)
+            self.assertEqual(
+                preview["instances"],
+                [
+                    {"id": "c1[0]", "parameters": {"browser": "chrome", "n": 1}},
+                    {"id": "c1[1]", "parameters": {"browser": "chrome", "n": 2}},
+                    {"id": "c1[2]", "parameters": {"browser": "firefox", "n": 1}},
+                    {"id": "c1[3]", "parameters": {"browser": "firefox", "n": 2}},
+                ],
+            )
+
+    def test_rows_instances_over_http(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            server.json(
+                "POST",
+                "/v1/cases",
+                case_payload("c1", parameterization={"rows": [{"a": 1}, {"a": None}, {"a": 1}]}),
+            )
+            status, preview = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(status, 200)
+            self.assertEqual(preview["count"], 3)
+            self.assertEqual(
+                [i["parameters"] for i in preview["instances"]],
+                [{"a": 1}, {"a": None}, {"a": 1}],
+            )
+            self.assertEqual([i["id"] for i in preview["instances"]], ["c1[0]", "c1[1]", "c1[2]"])
+
+    def test_plain_case_instances(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            status, _ = server.json("POST", "/v1/cases", case_payload("c1"))
+            self.assertEqual(status, 201)
+            status, preview = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                preview,
+                {"case_id": "c1", "count": 1, "instances": [{"id": "c1[0]", "parameters": {}}]},
+            )
+            # A plain case response still carries no parameterization field.
+            _, case = server.json("GET", "/v1/cases/c1")
+            self.assertNotIn("parameterization", case)
+
+    def test_instances_of_disabled_case_previewable(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            server.json("POST", "/v1/cases", case_payload("c1", enabled=False))
+            status, preview = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(status, 200)
+            self.assertEqual(preview["count"], 1)
+
+    def test_instances_404_and_routing(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            server.json("POST", "/v1/cases", case_payload("c1"))
+            status, body = server.json("GET", "/v1/cases/ghost/instances")
+            self.assertEqual(status, 404)
+            self.assertEqual(body["error"]["code"], "case_not_found")
+            # Deeper or sibling paths keep the baseline 404.
+            for path in ("/v1/cases/c1/instances/extra", "/v1/cases/c1/other"):
+                status, body = server.json("GET", path)
+                self.assertEqual(status, 404, path)
+                self.assertEqual(body["error"]["code"], "not_found", path)
+            # Deleting the case removes the instance preview too.
+            status, _, _ = server.request("DELETE", "/v1/cases/c1")
+            self.assertEqual(status, 204)
+            status, body = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(status, 404)
+            self.assertEqual(body["error"]["code"], "case_not_found")
+
+    def test_parameterization_validation_http(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            bad = [
+                {"axes": {"a": [1]}, "rows": [{"a": 1}]},
+                {},
+                {"axes": {}},
+                {"axes": {"a": []}},
+                {"axes": {"1a": [1]}},
+                {"axes": {"a": [[1]]}},
+                {"rows": []},
+                {"rows": [{"a": 1}, {"b": 2}]},
+                {"rows": [{"a": [1]}]},
+                {"axes": {"a": list(range(1001))}},
+                {"rows": [{"a": i} for i in range(1001)]},
+                {"bogus": {}},
+            ]
+            for param in bad:
+                status, body = server.json(
+                    "POST", "/v1/cases", case_payload(parameterization=param)
+                )
+                self.assertEqual(status, 400, param)
+                self.assertEqual(body["error"]["code"], "validation_error", param)
+            # No partial case survives.
+            status, cases = server.json("GET", "/v1/cases")
+            self.assertEqual(status, 200)
+            self.assertEqual(cases, [])
+
+    def test_preview_does_not_mutate_catalog(self) -> None:
+        with ServerHarness() as server:
+            server.json("POST", "/v1/suites", {"id": "s1", "name": "S1"})
+            server.json(
+                "POST",
+                "/v1/cases",
+                case_payload("c1", parameterization={"axes": {"a": [1, 2]}}),
+            )
+            server.json("GET", "/v1/cases/c1/instances")
+            _, first = server.json("GET", "/v1/cases/c1/instances")
+            _, second = server.json("GET", "/v1/cases/c1/instances")
+            self.assertEqual(first, second)
+            _, cases = server.json("GET", "/v1/cases")
+            self.assertEqual(cases[0]["parameterization"], {"axes": {"a": [1, 2]}})
+
 
 if __name__ == "__main__":
     unittest.main()
