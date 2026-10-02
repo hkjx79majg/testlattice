@@ -6,8 +6,9 @@ import argparse
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlsplit
 
-from .service import Service
+from .service import ALLOWED_KINDS, ApiError, Service
 
 
 def env_address() -> tuple[str, int]:
@@ -18,10 +19,23 @@ def env_address() -> tuple[str, int]:
     return host, int(port)
 
 
+def _first(values: dict[str, list[str]], key: str) -> object:
+    return values[key][0] if key in values else None
+
+
+def _resource_id(path: str, prefix: str) -> str | None:
+    if not path.startswith(prefix):
+        return None
+    tail = unquote(path[len(prefix):])
+    if not tail or "/" in tail:
+        return None
+    return tail
+
+
 class Handler(BaseHTTPRequestHandler):
     service = Service()
 
-    def send_json(self, status: int, payload: dict) -> None:
+    def send_json(self, status: int, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -29,11 +43,181 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_no_content(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_error_body(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"error": {"code": code, "message": message}})
+
+    def send_api_error(self, error: ApiError) -> None:
+        self.send_error_body(error.status, error.code, error.message)
+
+    def read_body(self) -> object:
+        length_raw = self.headers.get("Content-Length")
+        try:
+            length = int(length_raw) if length_raw is not None else 0
+        except ValueError:
+            raise ApiError(400, "invalid_json", "request body is not valid JSON")
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ApiError(400, "invalid_json", "request body is not valid JSON")
+
+    # -- GET ------------------------------------------------------------
+
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        parts = urlsplit(self.path)
+        path = parts.path
+        if path == "/v1/suites":
+            self.handle_list_suites()
+            return
+        suite_id = _resource_id(path, "/v1/suites/")
+        if suite_id is not None:
+            self.handle_get_suite(suite_id)
+            return
+        if path == "/v1/cases":
+            self.handle_list_cases(parts.query)
+            return
+        case_id = _resource_id(path, "/v1/cases/")
+        if case_id is not None:
+            self.handle_get_case(case_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def handle_get_suite(self, suite_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_suite(suite_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_list_suites(self) -> None:
+        self.send_json(200, self.service.list_suites())
+
+    def handle_get_case(self, case_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_case(case_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_list_cases(self, query: str) -> None:
+        try:
+            filters = self.parse_case_filters(parse_qs(query, keep_blank_values=True))
+            self.send_json(200, self.service.list_cases(filters))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    @staticmethod
+    def parse_case_filters(values: dict[str, list[str]]) -> dict[str, object]:
+        filters: dict[str, object] = {}
+
+        suite_id = _first(values, "suite_id")
+        if suite_id is not None:
+            if suite_id == "":
+                raise ApiError(400, "validation_error", "suite_id must be a non-empty string")
+            filters["suite_id"] = suite_id
+
+        if "include_descendants" in values:
+            raw = values["include_descendants"][0]
+            if raw not in ("true", "false"):
+                raise ApiError(400, "validation_error", "include_descendants must be true or false")
+            filters["include_descendants"] = raw == "true"
+
+        kind = _first(values, "kind")
+        if kind is not None:
+            if kind not in ALLOWED_KINDS:
+                raise ApiError(400, "validation_error", f"kind must be one of: {', '.join(ALLOWED_KINDS)}")
+            filters["kind"] = kind
+
+        if "enabled" in values:
+            raw = values["enabled"][0]
+            if raw not in ("true", "false"):
+                raise ApiError(400, "validation_error", "enabled must be true or false")
+            filters["enabled"] = raw == "true"
+
+        if "tags" in values:
+            tags: list[str] = []
+            for raw in values["tags"]:
+                for tag in raw.split(","):
+                    if tag == "":
+                        raise ApiError(400, "validation_error", "tags must be non-empty strings")
+                    if tag not in tags:
+                        tags.append(tag)
+            filters["tags"] = tags
+
+        if filters.get("include_descendants") and "suite_id" not in filters:
+            raise ApiError(
+                400,
+                "validation_error",
+                "include_descendants can only be used together with suite_id",
+            )
+        return filters
+
+    # -- POST -----------------------------------------------------------
+
+    def do_POST(self) -> None:
+        parts = urlsplit(self.path)
+        if parts.path == "/v1/suites":
+            self.handle_create_suite()
+            return
+        if parts.path == "/v1/cases":
+            self.handle_create_case()
+            return
+        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def handle_create_suite(self) -> None:
+        try:
+            payload = self.read_body()
+            suite = self.service.create_suite(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, suite)
+
+    def handle_create_case(self) -> None:
+        try:
+            payload = self.read_body()
+            case = self.service.create_case(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, case)
+
+    # -- DELETE ---------------------------------------------------------
+
+    def do_DELETE(self) -> None:
+        parts = urlsplit(self.path)
+        path = parts.path
+        suite_id = _resource_id(path, "/v1/suites/")
+        if suite_id is not None:
+            self.handle_delete_suite(suite_id)
+            return
+        case_id = _resource_id(path, "/v1/cases/")
+        if case_id is not None:
+            self.handle_delete_case(case_id)
+            return
+        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def handle_delete_suite(self, suite_id: str) -> None:
+        try:
+            self.service.delete_suite(suite_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_no_content()
+
+    def handle_delete_case(self, case_id: str) -> None:
+        try:
+            self.service.delete_case(case_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_no_content()
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
