@@ -32,7 +32,19 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 `GET /v1/cases/{case_id}/instances` 返回 `{"case_id", "count", "instances"}` 预览（不修改目录数据，禁用用例也可预览）。每个实例为 `{"id", "parameters"}`：`id` 是用例 id 加从零开始的方括号序号（如 `c1[0]`）；无 `parameterization` 的用例返回唯一一个 `parameters` 为空对象的实例。用例不存在返回 404 `case_not_found`，删除用例后该入口随之不可用。
 
-- 错误统一为 `{"error": {"code", "message"}}`：JSON 解析失败为 400 `invalid_json`，其余请求体/过滤参数错误为 400 `validation_error`，不存在为 404 `suite_not_found`/`case_not_found`，`id` 冲突为 409 `suite_exists`/`case_exists`。
+## 夹具与执行计划
+
+夹具（fixture）描述可复用的准备/清理步骤，进程内保存、重启清空。提供 `POST /v1/fixtures`（201）、`GET /v1/fixtures`（按创建顺序）、`GET /v1/fixtures/{fixture_id}` 与 `DELETE /v1/fixtures/{fixture_id}`（204，无正文）。
+
+- 夹具字段：`id`（唯一）、`name`（均去除首尾空白后须非空）、`setup_steps`、`teardown_steps`（均为步骤数组，至少一边非空，步骤约束同用例步骤），以及可选 `dependencies`。
+- `dependencies` 按声明顺序保存，只能引用已存在的夹具，不得重复或自依赖；字段缺省时不补入响应，显式空数组保留。
+- 用例创建时可选 `fixture_ids`，按声明顺序引用已有夹具且不得重复；缺省不出现在创建、读取或列表响应中，显式空数组保留。
+- 引用的夹具不存在返回 404 `fixture_not_found`；非法字段、类型、标识、步骤、重复引用或自依赖返回 400 `validation_error`，失败不留部分数据；夹具 `id` 冲突返回 409 `fixture_exists`。
+- 仍被其他夹具直接依赖或被用例直接引用的夹具不可删除（409 `fixture_in_use`）；删除不存在的夹具返回 404 `fixture_not_found`。
+
+`GET /v1/cases/{case_id}/execution-plan` 只读预览各参数化实例的夹具编排，返回 `{"case_id", "count", "instances"}`。每个实例保留 `id` 与 `parameters`，并带有 `setup`、`steps`、`teardown`：`steps` 为用例步骤；`setup` 与 `teardown` 的每项为 `{"fixture_id", "steps"}`。依赖夹具先进入 `setup`，`teardown` 严格反序；同一夹具经多条路径只出现一次，同级次序由 `fixture_ids` 与 `dependencies` 的声明顺序决定。无夹具时 `setup` 与 `teardown` 为空数组；禁用用例仍可预览，预览不修改目录；用例不存在或已删除返回 404 `case_not_found`。
+
+- 错误统一为 `{"error": {"code", "message"}}`：JSON 解析失败为 400 `invalid_json`，其余请求体/过滤参数错误为 400 `validation_error`，不存在为 404 `suite_not_found`/`case_not_found`/`fixture_not_found`，`id` 冲突为 409 `suite_exists`/`case_exists`/`fixture_exists`，未知路由为 404 `not_found`。
 
 ## 验证
 
