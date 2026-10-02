@@ -58,6 +58,21 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 成功返回 200：`{"passed", "summary", "results"}`，`summary` 为 `{"total", "passed", "failed"}`，`passed` 仅在全部通过时为 `true`。
 - 非 JSON 请求体返回 400 `invalid_json`；请求体不是对象、缺少 `actual`/`assertions`、数组为空或超过 1000 项、断言不是对象、含未知字段、`id` 缺失/为空/重复、`operator` 未知、`type` 的 `expected` 非法或 `path` 不是合法 JSON Pointer 时返回 400 `validation_error`，不返回任何部分结果。
 
+## JSON 快照与确定性差异比对
+
+进程内保存 JSON 快照，重启后数据清空。提供 `POST /v1/snapshots`（201，返回该对象）、`GET /v1/snapshots`（按创建顺序）、`GET /v1/snapshots/{snapshot_id}`、`DELETE /v1/snapshots/{snapshot_id}`（204，无正文）。
+
+- 创建请求只含 `id`（去除首尾空白后须非空、唯一）与 `value`（任意 JSON 值，包括 `null`）；保存与响应均与请求对象隔离，删除后 `id` 可复用。
+- 重复 `id` 返回 409 `snapshot_exists`；读取、删除或比对不存在的快照返回 404 `snapshot_not_found`；失败创建不留数据。
+
+`POST /v1/snapshots/{snapshot_id}/compare` 将必填的 `actual` 与保存值（expected）比对，不修改快照。请求只允许 `actual` 与可选 `ignore_paths`：无重复的 RFC 6901 JSON Pointer 字符串数组，缺省或为空数组表示不忽略；空指针 `""` 忽略整棵根，合法但未命中的路径无影响，命中节点及其后代均不比较。
+
+- 对象键顺序不影响结果；数组按下标比较；布尔值不等于数字（`true` 不等于 `1`）。容器类型不同或标量不等只在当前位置产生一条 `value_mismatch`（回显 `expected` 与 `actual`），不向下展开。
+- expected 缺少的实际成员产生 `missing_actual`（回显 `expected`）；actual 多出的成员产生 `unexpected_actual`（回显 `actual`）。
+- 对象键按 Unicode 码点、数组按下标升序遍历，差异 `path` 使用 RFC 6901 转义（`~0`/`~1`），结果顺序稳定；对象成员取并集按键序交错输出。
+- 成功返回 200：`{"snapshot_id", "passed", "summary", "differences"}`，`summary` 含 `total` 及 `value_mismatch`、`missing_actual`、`unexpected_actual` 三个计数，仅无差异时 `passed` 为 `true`。
+- 畸形 JSON 返回 400 `invalid_json`；请求体类型错误、字段缺失或未知、`ignore_paths` 类型错误、指针非法或重复返回 400 `validation_error`。
+
 ## 验证
 
 ```bash

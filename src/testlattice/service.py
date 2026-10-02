@@ -204,6 +204,7 @@ class Service:
         self._suites: dict[str, dict] = {}
         self._cases: dict[str, dict] = {}
         self._fixtures: dict[str, dict] = {}
+        self._snapshots: dict[str, dict] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -597,3 +598,74 @@ class Service:
                 for index, values in enumerate(parameters)
             ]
             return {"case_id": case_id, "count": len(instances), "instances": instances}
+
+    # -- snapshots ---------------------------------------------------------
+
+    def create_snapshot(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"id", "value"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "id" not in payload:
+            raise _validation("id is required")
+        if "value" not in payload:
+            raise _validation("value is required")
+
+        snapshot_id = _clean_text(payload["id"], "id")
+        # `value` accepts any JSON value, including null; deepcopy isolates
+        # stored state from both request and response objects.
+        snapshot = {"id": snapshot_id, "value": copy.deepcopy(payload["value"])}
+        with self._lock:
+            if snapshot_id in self._snapshots:
+                raise ApiError(
+                    409,
+                    "snapshot_exists",
+                    f"snapshot {snapshot_id!r} already exists",
+                )
+            self._snapshots[snapshot_id] = snapshot
+            return copy.deepcopy(snapshot)
+
+    def get_snapshot(self, snapshot_id: str) -> dict:
+        with self._lock:
+            snapshot = self._snapshots.get(snapshot_id)
+            if snapshot is None:
+                raise ApiError(
+                    404,
+                    "snapshot_not_found",
+                    f"snapshot {snapshot_id!r} not found",
+                )
+            return copy.deepcopy(snapshot)
+
+    def list_snapshots(self) -> list[dict]:
+        """Snapshots are returned in creation order."""
+        with self._lock:
+            return [copy.deepcopy(snapshot) for snapshot in self._snapshots.values()]
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        with self._lock:
+            if snapshot_id not in self._snapshots:
+                raise ApiError(
+                    404,
+                    "snapshot_not_found",
+                    f"snapshot {snapshot_id!r} not found",
+                )
+            del self._snapshots[snapshot_id]
+
+    def compare_snapshot(
+        self, snapshot_id: str, actual: object, ignored: frozenset[str]
+    ) -> dict:
+        """Compare ``actual`` against the stored value without mutating it."""
+        from .snapshots import compare_values
+
+        with self._lock:
+            snapshot = self._snapshots.get(snapshot_id)
+            if snapshot is None:
+                raise ApiError(
+                    404,
+                    "snapshot_not_found",
+                    f"snapshot {snapshot_id!r} not found",
+                )
+            expected = copy.deepcopy(snapshot["value"])
+        result = compare_values(expected, actual, ignored)
+        return {"snapshot_id": snapshot_id, **result}
