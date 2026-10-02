@@ -12,6 +12,15 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 服务默认监听 `127.0.0.1:8080`，可通过 `TESTLATTICE_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。
 
+## 用例目录
+
+进程内维护套件（suite）与用例（case）两类资源，重启即清空：
+
+- `POST /v1/suites`、`GET /v1/suites`、`GET /v1/suites/{id}`、`DELETE /v1/suites/{id}`
+- `POST /v1/cases`、`GET /v1/cases`、`GET /v1/cases/{id}`、`DELETE /v1/cases/{id}`
+
+套件支持任意深度嵌套（`parent_id`），查询按父节点在前的深度优先返回；用例查询保持创建顺序，支持 `suite_id`、`include_descendants`、`kind`、`enabled`、`tags` 过滤。创建/读取返回 201/200 JSON，删除返回无正文的 204；错误统一为 `{"error": {"code", "message"}}` 结构（`invalid_json`、`validation_error`、`suite_not_found`、`case_not_found`、`suite_exists`、`case_exists`、`suite_not_empty`）。
+
 ## 验证
 
 ```bash
