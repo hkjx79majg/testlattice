@@ -44,6 +44,19 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 `GET /v1/cases/{case_id}/execution-plan` 只读预览各参数化实例的夹具编排，返回 `{"case_id", "count", "instances"}`。每个实例保留 `id` 与 `parameters`，并带有 `setup`、`steps`、`teardown`：`steps` 为用例步骤；`setup` 与 `teardown` 的每项为 `{"fixture_id", "steps"}`。依赖夹具先进入 `setup`，`teardown` 严格反序；同一夹具经多条路径只出现一次，同级次序由 `fixture_ids` 与 `dependencies` 的声明顺序决定。无夹具时 `setup` 与 `teardown` 为空数组；禁用用例仍可预览，预览不修改目录；用例不存在或已删除返回 404 `case_not_found`。
 
+## 断言判定
+
+`POST /v1/assertions/evaluate` 提供无状态 JSON 值判定：接收 `{"actual", "assertions"}`，不读取也不修改目录数据，重复调用彼此独立。返回 200 与 `{"passed", "summary", "results"}`：`summary` 为 `{"total", "passed", "failed"}`，`passed` 仅在全部断言通过时为 `true`。
+
+- `assertions` 是 1 至 1000 项的数组，按请求顺序求值并按同序返回结果；单项失败不中止后续断言。每项含唯一非空字符串 `id`、`operator`、`expected`，可选 `path`（缺省为空字符串，指向 `actual` 根值）。
+- `path` 遵循 RFC 6901 JSON Pointer：空字符串为根，支持对象键、数组下标（`0` 或无前导零的数字；`-` 与越界下标均视为未命中）与 `~0`、`~1` 转义。
+- 运算符：
+  - `equals` / `not_equals`：按 JSON 结构深比较；布尔值与数字不同，数组顺序有意义，对象键顺序无意义。
+  - `contains`：字符串检查字符串子串（`expected` 必须为字符串），数组检查是否含深度相等的元素；其他 `actual` 类型或字符串/非字符串组合判为类型不匹配。
+  - `type`：`expected` 只能是 `null`、`boolean`、`number`、`string`、`array`、`object` 之一。
+- 每项结果回显 `id`、`path`、`operator`、`expected`；路径存在时回显 `actual`，并带 `passed` 与 `code`。`code` 取值：`ok`、`value_mismatch`（值不满足）、`path_not_found`（路径不存在或数组下标无效）、`type_mismatch`（`contains`/`type` 类型不符）。
+- 请求体不是对象、缺少 `actual` 或 `assertions`、数组为空或超过 1000 项、断言不是对象、含未知字段、`id` 为空或重复、`operator` 未知、`type` 的 `expected` 非法、或 `path` 不是合法 JSON Pointer，均返回 400 `validation_error` 且不返回部分结果；非 JSON 请求仍为 400 `invalid_json`。
+
 - 错误统一为 `{"error": {"code", "message"}}`：JSON 解析失败为 400 `invalid_json`，其余请求体/过滤参数错误为 400 `validation_error`，不存在为 404 `suite_not_found`/`case_not_found`/`fixture_not_found`，`id` 冲突为 409 `suite_exists`/`case_exists`/`fixture_exists`，未知路由为 404 `not_found`。
 
 ## 验证
