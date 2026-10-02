@@ -149,6 +149,35 @@ def _validate_rows(rows: object) -> list[dict]:
     return cleaned
 
 
+def _validate_steps(value: object, field: str) -> list[dict]:
+    """Step arrays share the case-step constraint: objects with an action."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    for index, step in enumerate(value):
+        if not isinstance(step, dict):
+            raise _validation(f"{field}[{index}] must be a JSON object")
+        action = step.get("action")
+        if not isinstance(action, str) or action == "":
+            raise _validation(f"{field}[{index}].action must be a non-empty string")
+    return copy.deepcopy(value)
+
+
+def _validate_fixture_refs(value: object, field: str, own_id: str | None = None) -> list[str]:
+    """Ordered fixture references: non-empty strings, no duplicates, no self."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    refs: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item:
+            raise _validation(f"{field}[{index}] must be a non-empty string")
+        if own_id is not None and item == own_id:
+            raise _validation(f"{field} must not reference the fixture itself")
+        if item in refs:
+            raise _validation(f"{field} contains duplicate reference {item!r}")
+        refs.append(item)
+    return refs
+
+
 def _expand_parameterization(parameterization: dict | None) -> list[dict]:
     """Expand a validated definition into ordered parameter maps."""
     if parameterization is None:
@@ -176,6 +205,7 @@ class Service:
         self._lock = threading.RLock()
         self._suites: dict[str, dict] = {}
         self._cases: dict[str, dict] = {}
+        self._fixtures: dict[str, dict] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -275,6 +305,137 @@ class Service:
 
             del self._suites[suite_id]
 
+    # -- fixtures ---------------------------------------------------------
+
+    def _validate_fixture(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        allowed = {"id", "name", "setup_steps", "teardown_steps", "dependencies"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("id", "name", "setup_steps", "teardown_steps"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+
+        fixture_id = _clean_text(payload["id"], "id")
+        name = _clean_text(payload["name"], "name")
+        setup_steps = _validate_steps(payload["setup_steps"], "setup_steps")
+        teardown_steps = _validate_steps(payload["teardown_steps"], "teardown_steps")
+        if not setup_steps and not teardown_steps:
+            raise _validation(
+                "setup_steps and teardown_steps must not both be empty"
+            )
+
+        fixture = {
+            "id": fixture_id,
+            "name": name,
+            "setup_steps": setup_steps,
+            "teardown_steps": teardown_steps,
+        }
+        if "dependencies" in payload and payload["dependencies"] is not None:
+            fixture["dependencies"] = _validate_fixture_refs(
+                payload["dependencies"], "dependencies", own_id=fixture_id
+            )
+        return fixture
+
+    def create_fixture(self, payload: object) -> dict:
+        fixture = self._validate_fixture(payload)
+        with self._lock:
+            if fixture["id"] in self._fixtures:
+                raise ApiError(
+                    409, "fixture_exists", f"fixture {fixture['id']!r} already exists"
+                )
+            for dependency in fixture.get("dependencies", ()):
+                if dependency not in self._fixtures:
+                    raise ApiError(
+                        404, "fixture_not_found", f"fixture {dependency!r} not found"
+                    )
+            self._fixtures[fixture["id"]] = fixture
+            return copy.deepcopy(fixture)
+
+    def get_fixture(self, fixture_id: str) -> dict:
+        with self._lock:
+            fixture = self._fixtures.get(fixture_id)
+            if fixture is None:
+                raise ApiError(404, "fixture_not_found", f"fixture {fixture_id!r} not found")
+            return copy.deepcopy(fixture)
+
+    def list_fixtures(self) -> list[dict]:
+        """Fixtures come back in creation order."""
+        with self._lock:
+            return [copy.deepcopy(fixture) for fixture in self._fixtures.values()]
+
+    def delete_fixture(self, fixture_id: str) -> None:
+        with self._lock:
+            if fixture_id not in self._fixtures:
+                raise ApiError(404, "fixture_not_found", f"fixture {fixture_id!r} not found")
+            for fixture in self._fixtures.values():
+                if fixture_id in fixture.get("dependencies", ()):
+                    raise ApiError(
+                        409, "fixture_in_use", f"fixture {fixture_id!r} is still in use"
+                    )
+            for case in self._cases.values():
+                if fixture_id in case.get("fixture_ids", ()):
+                    raise ApiError(
+                        409, "fixture_in_use", f"fixture {fixture_id!r} is still in use"
+                    )
+            del self._fixtures[fixture_id]
+
+    # -- execution plan -----------------------------------------------------
+
+    def get_execution_plan(self, case_id: str) -> dict:
+        """Read-only preview of the fixture lifecycle around each instance."""
+        with self._lock:
+            case = self._cases.get(case_id)
+            if case is None:
+                raise ApiError(404, "case_not_found", f"case {case_id!r} not found")
+
+            # Dependencies run before the fixtures that declare them; each
+            # fixture is emitted once, at its first post-order position.
+            ordered: list[str] = []
+            seen: set[str] = set()
+
+            def visit(fixture_id: str) -> None:
+                if fixture_id in seen:
+                    return
+                seen.add(fixture_id)
+                fixture = self._fixtures[fixture_id]
+                for dependency in fixture.get("dependencies", ()):
+                    visit(dependency)
+                ordered.append(fixture_id)
+
+            for fixture_id in case.get("fixture_ids", ()):
+                visit(fixture_id)
+
+            setup = [
+                {
+                    "fixture_id": fixture_id,
+                    "steps": copy.deepcopy(self._fixtures[fixture_id]["setup_steps"]),
+                }
+                for fixture_id in ordered
+            ]
+            teardown = [
+                {
+                    "fixture_id": fixture_id,
+                    "steps": copy.deepcopy(self._fixtures[fixture_id]["teardown_steps"]),
+                }
+                for fixture_id in reversed(ordered)
+            ]
+            steps = copy.deepcopy(case["steps"])
+            parameters = _expand_parameterization(case.get("parameterization"))
+            instances = [
+                {
+                    "id": f"{case_id}[{index}]",
+                    "parameters": copy.deepcopy(values),
+                    "setup": copy.deepcopy(setup),
+                    "steps": copy.deepcopy(steps),
+                    "teardown": copy.deepcopy(teardown),
+                }
+                for index, values in enumerate(parameters)
+            ]
+            return {"case_id": case_id, "count": len(instances), "instances": instances}
+
     # -- cases ----------------------------------------------------------
 
     def _validate_case(self, payload: object) -> dict:
@@ -290,6 +451,7 @@ class Service:
             "enabled",
             "timeout_seconds",
             "parameterization",
+            "fixture_ids",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -309,12 +471,7 @@ class Service:
         steps = payload["steps"]
         if not isinstance(steps, list) or not steps:
             raise _validation("steps must be a non-empty array")
-        for index, step in enumerate(steps):
-            if not isinstance(step, dict):
-                raise _validation(f"steps[{index}] must be a JSON object")
-            action = step.get("action")
-            if not isinstance(action, str) or action == "":
-                raise _validation(f"steps[{index}].action must be a non-empty string")
+        steps = _validate_steps(steps, "steps")
 
         tags: list[str] = []
         if "tags" in payload and payload["tags"] is not None:
@@ -358,6 +515,10 @@ class Service:
             case["parameterization"] = _validate_parameterization(
                 payload["parameterization"]
             )
+        if "fixture_ids" in payload and payload["fixture_ids"] is not None:
+            case["fixture_ids"] = _validate_fixture_refs(
+                payload["fixture_ids"], "fixture_ids"
+            )
         return case
 
     def create_case(self, payload: object) -> dict:
@@ -367,6 +528,11 @@ class Service:
                 raise ApiError(409, "case_exists", f"case {case['id']!r} already exists")
             if case["suite_id"] not in self._suites:
                 raise ApiError(404, "suite_not_found", f"suite {case['suite_id']!r} not found")
+            for fixture_id in case.get("fixture_ids", ()):
+                if fixture_id not in self._fixtures:
+                    raise ApiError(
+                        404, "fixture_not_found", f"fixture {fixture_id!r} not found"
+                    )
             self._cases[case["id"]] = case
             return copy.deepcopy(case)
 

@@ -97,9 +97,20 @@ class Handler(BaseHTTPRequestHandler):
         if case_id is not None:
             self.handle_get_instances(case_id)
             return
+        case_id = _subresource(path, "/v1/cases/", "/execution-plan")
+        if case_id is not None:
+            self.handle_get_execution_plan(case_id)
+            return
         case_id = _resource_id(path, "/v1/cases/")
         if case_id is not None:
             self.handle_get_case(case_id)
+            return
+        if path == "/v1/fixtures":
+            self.handle_list_fixtures()
+            return
+        fixture_id = _resource_id(path, "/v1/fixtures/")
+        if fixture_id is not None:
+            self.handle_get_fixture(fixture_id)
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
@@ -123,6 +134,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.get_instances(case_id))
         except ApiError as error:
             self.send_api_error(error)
+
+    def handle_get_execution_plan(self, case_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_execution_plan(case_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_get_fixture(self, fixture_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_fixture(fixture_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_list_fixtures(self) -> None:
+        self.send_json(200, self.service.list_fixtures())
 
     def handle_list_cases(self, query: str) -> None:
         try:
@@ -187,6 +213,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/v1/cases":
             self.handle_create_case()
             return
+        if parts.path == "/v1/fixtures":
+            self.handle_create_fixture()
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_create_suite(self) -> None:
@@ -207,6 +236,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(201, case)
 
+    def handle_create_fixture(self) -> None:
+        try:
+            payload = self.read_body()
+            fixture = self.service.create_fixture(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, fixture)
+
     # -- DELETE ---------------------------------------------------------
 
     def do_DELETE(self) -> None:
@@ -219,6 +257,10 @@ class Handler(BaseHTTPRequestHandler):
         case_id = _resource_id(path, "/v1/cases/")
         if case_id is not None:
             self.handle_delete_case(case_id)
+            return
+        fixture_id = _resource_id(path, "/v1/fixtures/")
+        if fixture_id is not None:
+            self.handle_delete_fixture(fixture_id)
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
@@ -233,6 +275,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_delete_case(self, case_id: str) -> None:
         try:
             self.service.delete_case(case_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_no_content()
+
+    def handle_delete_fixture(self, fixture_id: str) -> None:
+        try:
+            self.service.delete_fixture(fixture_id)
         except ApiError as error:
             self.send_api_error(error)
             return

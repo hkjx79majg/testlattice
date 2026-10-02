@@ -34,6 +34,18 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 - 错误统一为 `{"error": {"code", "message"}}`：JSON 解析失败为 400 `invalid_json`，其余请求体/过滤参数错误为 400 `validation_error`，不存在为 404 `suite_not_found`/`case_not_found`，`id` 冲突为 409 `suite_exists`/`case_exists`。
 
+## 夹具与执行计划
+
+夹具（fixture）描述可复用的前置/后置步骤，通过 `/v1/fixtures` 创建（201）、列表/读取（200）和删除（204，无正文）；数据同样随进程结束而清空，列表按创建顺序返回。
+
+- 夹具字段：`id`（唯一）、`name`（与 `id` 一样去除首尾空白后须非空）、`setup_steps`、`teardown_steps`，以及可选 `dependencies`。两个步骤数组均为数组且至少一边非空，每个步骤沿用用例步骤的约束（含非空 `action` 的对象）。
+- `dependencies` 按声明顺序保存，只能引用已存在的夹具，不得重复或自依赖；字段缺省时不补入响应，显式空数组则保留。
+- 用例创建时可选 `fixture_ids`，按声明顺序引用已有夹具且不得重复；缺省时不向创建、读取或列表响应补入，显式空数组保留。
+- 引用不存在的夹具返回 404 `fixture_not_found`；非法字段、类型、标识、步骤、重复引用或自依赖返回 400 `validation_error`，失败不留下部分数据；夹具 `id` 冲突返回 409 `fixture_exists`。
+- 仍被其他夹具直接依赖或被用例直接引用的夹具不可删除（409 `fixture_in_use`）；删除不存在的夹具返回 404 `fixture_not_found`。
+
+`GET /v1/cases/{case_id}/execution-plan` 只读预览各参数化实例的夹具编排，返回 `{"case_id", "count", "instances"}`。实例保留 `id` 与 `parameters`，并带有 `setup`、`steps`、`teardown`：`steps` 是用例步骤；`setup` 与 `teardown` 的每项为 `{"fixture_id", "steps"}`，分别取夹具的 `setup_steps` 与 `teardown_steps`。依赖夹具先进入 `setup`，`teardown` 严格反序；同一夹具经多条路径只出现一次，同级次序由 `fixture_ids` 与 `dependencies` 的声明顺序决定。无夹具时 `setup` 与 `teardown` 为空数组；禁用用例仍可预览，预览不修改目录；用例不存在或已删除返回 404 `case_not_found`。
+
 ## 验证
 
 ```bash
