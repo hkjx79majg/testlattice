@@ -8,6 +8,8 @@ on a threading server.
 from __future__ import annotations
 
 import copy
+import math
+import re
 import threading
 from collections.abc import Mapping
 
@@ -17,6 +19,8 @@ ALLOWED_KINDS = ("unit", "api", "browser", "contract")
 DEFAULT_TIMEOUT_SECONDS = 300
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 86400
+MAX_INSTANCES = 1000
+_PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class ApiError(Exception):
@@ -47,6 +51,119 @@ def _reference(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise _validation(f"{field} must be a non-empty string")
     return value
+
+
+def _is_scalar(value: object) -> bool:
+    """Parameter values may be strings, numbers, booleans or null."""
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, (int, float)):
+        return not isinstance(value, float) or math.isfinite(value)
+    return False
+
+
+def _valid_param_name(name: object) -> bool:
+    return isinstance(name, str) and _PARAM_NAME_RE.fullmatch(name) is not None
+
+
+def _validate_parameterization(value: object) -> dict:
+    """Validate the optional parameterization block; exactly one of axes/rows."""
+    if not isinstance(value, dict):
+        raise _validation("parameterization must be a JSON object")
+    unknown = set(value) - {"axes", "rows"}
+    if unknown:
+        raise _validation(
+            f"parameterization unknown fields: {', '.join(sorted(unknown))}"
+        )
+    if "axes" in value and "rows" in value:
+        raise _validation("parameterization must use either axes or rows, not both")
+    if "axes" in value:
+        return {"axes": _validate_axes(value["axes"])}
+    if "rows" in value:
+        return {"rows": _validate_rows(value["rows"])}
+    raise _validation("parameterization must contain either axes or rows")
+
+
+def _validate_axes(axes: object) -> dict:
+    if not isinstance(axes, dict) or not axes:
+        raise _validation("parameterization.axes must be a non-empty object")
+    cleaned: dict[str, list] = {}
+    for name, values in axes.items():
+        if not _valid_param_name(name):
+            raise _validation(
+                f"parameterization axis name {name!r} must match [A-Za-z_][A-Za-z0-9_]*"
+            )
+        if not isinstance(values, list) or not values:
+            raise _validation(f"parameterization.axes.{name} must be a non-empty array")
+        for index, item in enumerate(values):
+            if not _is_scalar(item):
+                raise _validation(
+                    f"parameterization.axes.{name}[{index}] must be a scalar"
+                )
+        cleaned[name] = copy.deepcopy(values)
+    count = 1
+    for values in cleaned.values():
+        count *= len(values)
+    if count > MAX_INSTANCES:
+        raise _validation(
+            f"parameterization expands to {count} instances; limit is {MAX_INSTANCES}"
+        )
+    return cleaned
+
+
+def _validate_rows(rows: object) -> list[dict]:
+    if not isinstance(rows, list) or not rows:
+        raise _validation("parameterization.rows must be a non-empty array")
+    cleaned: list[dict] = []
+    expected: tuple[str, ...] | None = None
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, dict) or not row:
+            raise _validation(
+                f"parameterization.rows[{row_index}] must be a non-empty object"
+            )
+        names = tuple(row)
+        for name in names:
+            if not _valid_param_name(name):
+                raise _validation(
+                    f"parameterization rows[{row_index}] parameter name {name!r} "
+                    "must match [A-Za-z_][A-Za-z0-9_]*"
+                )
+        if expected is None:
+            expected = names
+        elif set(names) != set(expected):
+            raise _validation(
+                "parameterization.rows must all have the same set of parameter names"
+            )
+        for name in expected:
+            item = row[name]
+            if not _is_scalar(item):
+                raise _validation(
+                    f"parameterization.rows[{row_index}].{name} must be a scalar"
+                )
+        # Preserve the canonical parameter order taken from the first row.
+        cleaned.append({name: copy.deepcopy(row[name]) for name in expected})
+    if len(cleaned) > MAX_INSTANCES:
+        raise _validation(
+            f"parameterization expands to {len(cleaned)} instances; limit is {MAX_INSTANCES}"
+        )
+    return cleaned
+
+
+def _expand_parameterization(parameterization: dict | None) -> list[dict]:
+    """Expand a validated definition into ordered parameter maps."""
+    if parameterization is None:
+        return [{}]
+    if "axes" in parameterization:
+        axes = parameterization["axes"]
+        combinations: list[dict] = [{}]
+        # Axes keep request declaration order; the rightmost axis varies fastest,
+        # so extend the running product one full axis at a time.
+        for name, values in axes.items():
+            combinations = [
+                {**combo, name: value} for combo in combinations for value in values
+            ]
+        return combinations
+    return copy.deepcopy(parameterization["rows"])
 
 
 class Service:
@@ -163,7 +280,17 @@ class Service:
     def _validate_case(self, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
-        allowed = {"id", "name", "suite_id", "kind", "steps", "tags", "enabled", "timeout_seconds"}
+        allowed = {
+            "id",
+            "name",
+            "suite_id",
+            "kind",
+            "steps",
+            "tags",
+            "enabled",
+            "timeout_seconds",
+            "parameterization",
+        }
         unknown = set(payload) - allowed
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
@@ -217,7 +344,7 @@ class Service:
                 )
             timeout = value
 
-        return {
+        case = {
             "id": case_id,
             "name": name,
             "suite_id": suite_id,
@@ -227,6 +354,11 @@ class Service:
             "enabled": enabled,
             "timeout_seconds": timeout,
         }
+        if "parameterization" in payload and payload["parameterization"] is not None:
+            case["parameterization"] = _validate_parameterization(
+                payload["parameterization"]
+            )
+        return case
 
     def create_case(self, payload: object) -> dict:
         case = self._validate_case(payload)
@@ -244,6 +376,20 @@ class Service:
             if case is None:
                 raise ApiError(404, "case_not_found", f"case {case_id!r} not found")
             return copy.deepcopy(case)
+
+    def get_instances(self, case_id: str) -> dict:
+        """Preview the execution instances without mutating catalog state."""
+        with self._lock:
+            case = self._cases.get(case_id)
+            if case is None:
+                raise ApiError(404, "case_not_found", f"case {case_id!r} not found")
+            parameterization = case.get("parameterization")
+            parameters = _expand_parameterization(parameterization)
+            instances = [
+                {"id": f"{case_id}[{index}]", "parameters": copy.deepcopy(values)}
+                for index, values in enumerate(parameters)
+            ]
+            return {"case_id": case_id, "count": len(instances), "instances": instances}
 
     def list_cases(self, filters: Mapping[str, object]) -> list[dict]:
         suite_id = filters.get("suite_id")

@@ -32,6 +32,15 @@ def _resource_id(path: str, prefix: str) -> str | None:
     return tail
 
 
+def _subresource(path: str, prefix: str, suffix: str) -> str | None:
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    middle = unquote(path[len(prefix):-len(suffix)])
+    if not middle or "/" in middle:
+        return None
+    return middle
+
+
 class Handler(BaseHTTPRequestHandler):
     service = Service()
 
@@ -84,6 +93,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/cases":
             self.handle_list_cases(parts.query)
             return
+        case_id = _subresource(path, "/v1/cases/", "/instances")
+        if case_id is not None:
+            self.handle_get_instances(case_id)
+            return
         case_id = _resource_id(path, "/v1/cases/")
         if case_id is not None:
             self.handle_get_case(case_id)
@@ -102,6 +115,12 @@ class Handler(BaseHTTPRequestHandler):
     def handle_get_case(self, case_id: str) -> None:
         try:
             self.send_json(200, self.service.get_case(case_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_get_instances(self, case_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_instances(case_id))
         except ApiError as error:
             self.send_api_error(error)
 
