@@ -8,6 +8,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .assertions import evaluate_assertions
 from .service import ALLOWED_KINDS, ApiError, Service
 
 
@@ -216,6 +217,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/v1/fixtures":
             self.handle_create_fixture()
             return
+        if parts.path == "/v1/assertions/evaluate":
+            self.handle_evaluate_assertions()
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_create_suite(self) -> None:
@@ -244,6 +248,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_api_error(error)
             return
         self.send_json(201, fixture)
+
+    def handle_evaluate_assertions(self) -> None:
+        try:
+            payload = self.read_body()
+            result = evaluate_assertions(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, result)
 
     # -- DELETE ---------------------------------------------------------
 

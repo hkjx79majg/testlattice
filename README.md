@@ -46,6 +46,18 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 - 错误统一为 `{"error": {"code", "message"}}`：JSON 解析失败为 400 `invalid_json`，其余请求体/过滤参数错误为 400 `validation_error`，不存在为 404 `suite_not_found`/`case_not_found`/`fixture_not_found`，`id` 冲突为 409 `suite_exists`/`case_exists`/`fixture_exists`，未知路由为 404 `not_found`。
 
+## 断言求值
+
+`POST /v1/assertions/evaluate` 提供无状态的 JSON 值判定，不读取也不修改目录数据。请求体为对象，含 `actual`（任意 JSON 值，包括 `null`）与 `assertions`（1 至 1000 项的数组），仅允许这两个字段。每项断言含唯一非空字符串 `id`、`operator`、`expected`，可选 `path`（缺省为空字符串，指向 `actual` 根值）；断言与结果均严格保持请求顺序。
+
+- `path` 遵循 RFC 6901 JSON Pointer：空字符串表示根，`/` 分隔对象键与数组下标，`~0` 与 `~1` 分别转义 `~` 与 `/`；数组下标须为无符号十进制且无前导零（`-` 不是合法下标）。路径不存在或下标无效时该项判为 `path_not_found`，非法指针语法在请求阶段返回 400。
+- `equals`/`not_equals` 按 JSON 结构深比较：布尔值与数字不同（`true` 不等于 `1`），数组顺序有意义，对象键顺序无意义。
+- `contains`：字符串检查字符串子串（`expected` 必须也是字符串，否则 `type_mismatch`）；数组检查是否含深度相等的元素（`expected` 可以是任意 JSON 值）；其他类型组合一律 `type_mismatch`。
+- `type` 的 `expected` 只能是 `null`、`boolean`、`number`、`string`、`array`、`object` 之一；实际值类型不符时该项判为 `type_mismatch`。
+- 单项结果回显 `id`、`path`、`operator`、`expected`，路径存在时额外回显解析到的 `actual`，并含 `passed` 与 `code`：通过为 `ok`，值不满足为 `value_mismatch`，路径不存在/下标无效为 `path_not_found`，`contains`/`type` 类型不符为 `type_mismatch`。单项失败不中止后续求值。
+- 成功返回 200：`{"passed", "summary", "results"}`，`summary` 为 `{"total", "passed", "failed"}`，`passed` 仅在全部通过时为 `true`。
+- 非 JSON 请求体返回 400 `invalid_json`；请求体不是对象、缺少 `actual`/`assertions`、数组为空或超过 1000 项、断言不是对象、含未知字段、`id` 缺失/为空/重复、`operator` 未知、`type` 的 `expected` 非法或 `path` 不是合法 JSON Pointer 时返回 400 `validation_error`，不返回任何部分结果。
+
 ## 验证
 
 ```bash
