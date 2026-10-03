@@ -96,6 +96,25 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 源运行不存在返回 404 `run_not_found`；源运行尚未完成返回 409 `run_incomplete`；筛选后没有可重试实例返回 409 `retry_not_needed`；新 `id` 已存在返回 409 `run_exists`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体不是对象、缺少 `id`、含未知字段，或 `outcomes` 的类型、成员、空值与重复性不符合约束时返回 400 `validation_error`。任何失败都不占用新 `id`，也不留下部分运行。
 
+### 租约式并行调度
+
+多个外部工作进程通过 `POST /v1/runs/{run_id}/claims` 安全领取任务；普通运行与重试运行中尚无有效租约的 `pending` 实例均可领取。请求体只允许 `worker_id`、`max_items`、`lease_seconds`：
+
+- `worker_id` 必填，去除首尾空白后须非空；`max_items` 缺省为 1，须为 1 至 100 的整数（显式 `null` 等同缺省）；`lease_seconds` 必填，须为 1 至 3600 的整数。布尔值、浮点数、字符串等非整数均不合规。
+- 成功返回 200 `{"claims": [...]}`，按冻结实例顺序选取前 `max_items` 个可领实例；无任务可领时仍返回 200 且 `claims` 为空数组。
+- 每项含唯一且不透明的 `claim_id`（与实例、工作进程标识无结构关联）、`instance_id`、`case_id`、`case_name`、`kind`、`parameters`、`timeout_seconds`、`setup`、`steps`、`teardown` 与 `expires_at`（租约到期的纪元毫秒整数）；冻结上下文语义与诊断导出一致。
+- 租约在当前时间达到 `expires_at` 时失效：实例仍为 `pending`，不产生结果、时长或覆盖率，随后可被再次领取并获得新的 `claim_id`。领取与结果提交在同一进程锁内原子处理，并发请求不会让同一实例同时拥有两个有效租约。
+- 运行不存在返回 404 `run_not_found`；已完成运行返回 409 `run_completed`；请求体类型、未知字段或字段取值不合规返回 400 `validation_error`；畸形 JSON 返回 400 `invalid_json`。
+
+`POST /v1/runs/{run_id}/results` 增加可选字符串字段 `claim_id`：
+
+- 实例有有效租约时，只有携带与该实例匹配的有效 `claim_id` 才能提交；未提供 `claim_id`，或携带属于其他实例的有效租约，返回 409 `claim_conflict`。
+- 使用过期、已消费、未知的标识，或提交给租约所属之外的实例（该标识本身已不具活性）返回 409 `claim_not_active`；任何失败都不写入结果或覆盖率，也不消费租约。
+- 成功提交在同一原子步骤内消费租约并沿用原有 `outcome`、`duration_ms`、`details`、`coverage`、重复结果（`result_exists`）与完成规则；已消费的租约再次使用返回 409 `claim_not_active`。实例无有效租约且未提供 `claim_id` 时保留原有直接提交行为；租约过期后直接提交同样可用。
+- `claim_id` 类型错误返回 400 `validation_error`；`run_completed`、`instance_not_found` 等既有判定保持不变。
+
+运行报告、跨运行聚合、JUnit XML、覆盖率、诊断导出、完成与重试响应均不增加租约字段；报告中的实例在被领取期间仍显示为 `pending`，其他既有入口保持兼容。
+
 ### 行覆盖率片段与合并
 
 提交实例结果时可携带可选 `coverage` 字段，与结果原子写入：片段不合规时整个提交返回 400 `validation_error`，实例保持 `pending`，结果与覆盖数据均不保存。`coverage` 只能含 `files` 字段；`files` 是非空对象，键为非空文件路径，值只能包含必填的 `executable_lines` 与 `covered_lines`：

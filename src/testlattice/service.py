@@ -11,7 +11,9 @@ import copy
 import math
 import re
 import threading
-from collections.abc import Mapping
+import time
+import uuid
+from collections.abc import Callable, Mapping
 
 from . import __version__
 
@@ -27,6 +29,11 @@ MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
+DEFAULT_CLAIM_MAX_ITEMS = 1
+MIN_CLAIM_MAX_ITEMS = 1
+MAX_CLAIM_MAX_ITEMS = 100
+MIN_LEASE_SECONDS = 1
+MAX_LEASE_SECONDS = 3600
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -367,7 +374,7 @@ class Service:
     name = "testlattice"
     version = __version__
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], int] | None = None) -> None:
         self._lock = threading.RLock()
         self._suites: dict[str, dict] = {}
         self._cases: dict[str, dict] = {}
@@ -376,6 +383,9 @@ class Service:
         self._runs: dict[str, dict] = {}
         # Run id -> {path: {"executable_lines": set[int], "covered_lines": set[int]}}
         self._coverage: dict[str, dict[str, dict[str, set[int]]]] = {}
+        # Injectable epoch-millisecond clock; lease expiry is the only state
+        # that depends on wall time.
+        self._clock = clock or (lambda: int(time.time() * 1000))
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -926,6 +936,11 @@ class Service:
                 "status": "open",
                 "instances": instances,
                 "contexts": contexts,
+                # claim_id -> record; instance index -> latest claim_id. Lease
+                # state lives outside the frozen instances so reports never
+                # expose lease fields.
+                "claims": {},
+                "instance_claims": {},
             }
             self._runs[run_id] = run
             return self._run_report(run)
@@ -1067,6 +1082,113 @@ class Service:
                 report["attempt"] = run["attempt"]
             return report
 
+    def _validate_claim_request(self, payload: object) -> tuple[str, int, int]:
+        """Validate a claims request body, returning (worker_id, max, lease)."""
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"worker_id", "max_items", "lease_seconds"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "worker_id" not in payload:
+            raise _validation("worker_id is required")
+        worker_id = payload["worker_id"]
+        if not isinstance(worker_id, str):
+            raise _validation("worker_id must be a string")
+        worker_id = worker_id.strip()
+        if not worker_id:
+            raise _validation("worker_id must not be empty")
+
+        max_items = DEFAULT_CLAIM_MAX_ITEMS
+        if "max_items" in payload and payload["max_items"] is not None:
+            value = payload["max_items"]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _validation("max_items must be an integer")
+            if not MIN_CLAIM_MAX_ITEMS <= value <= MAX_CLAIM_MAX_ITEMS:
+                raise _validation(
+                    f"max_items must be between {MIN_CLAIM_MAX_ITEMS} "
+                    f"and {MAX_CLAIM_MAX_ITEMS}"
+                )
+            max_items = value
+
+        if "lease_seconds" not in payload:
+            raise _validation("lease_seconds is required")
+        lease_seconds = payload["lease_seconds"]
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise _validation("lease_seconds must be an integer")
+        if not MIN_LEASE_SECONDS <= lease_seconds <= MAX_LEASE_SECONDS:
+            raise _validation(
+                f"lease_seconds must be between {MIN_LEASE_SECONDS} "
+                f"and {MAX_LEASE_SECONDS}"
+            )
+        return worker_id, max_items, lease_seconds
+
+    def _active_claim(
+        self, run: dict, index: int, now_ms: int
+    ) -> dict | None:
+        """Return the instance's live lease record, or None if absent/expired."""
+        claim_id = run["instance_claims"].get(index)
+        if claim_id is None:
+            return None
+        claim = run["claims"].get(claim_id)
+        if claim is None or claim["consumed"] or claim["expires_at"] <= now_ms:
+            return None
+        return claim
+
+    def claim_instances(self, run_id: str, payload: object) -> dict:
+        """Lease up to ``max_items`` pending instances that have no live lease.
+
+        Selection, lease creation and expiry evaluation happen under one lock
+        hold, so concurrent requests can never attach two live leases to the
+        same instance.
+        """
+        worker_id, max_items, lease_seconds = self._validate_claim_request(payload)
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+
+            now_ms = self._clock()
+            claims: list[dict] = []
+            for index, (instance, context) in enumerate(
+                zip(run["instances"], run["contexts"])
+            ):
+                if len(claims) >= max_items:
+                    break
+                if instance["outcome"] != "pending":
+                    continue
+                if self._active_claim(run, index, now_ms) is not None:
+                    continue
+                claim_id = uuid.uuid4().hex
+                expires_at = now_ms + lease_seconds * 1000
+                run["claims"][claim_id] = {
+                    "instance_index": index,
+                    "worker_id": worker_id,
+                    "expires_at": expires_at,
+                    "consumed": False,
+                }
+                run["instance_claims"][index] = claim_id
+                claims.append(
+                    {
+                        "claim_id": claim_id,
+                        "instance_id": copy.deepcopy(instance["instance_id"]),
+                        "case_id": copy.deepcopy(instance["case_id"]),
+                        "case_name": copy.deepcopy(instance["case_name"]),
+                        "kind": copy.deepcopy(context["kind"]),
+                        "parameters": copy.deepcopy(instance["parameters"]),
+                        "timeout_seconds": context["timeout_seconds"],
+                        "setup": copy.deepcopy(context["setup"]),
+                        "steps": copy.deepcopy(context["steps"]),
+                        "teardown": copy.deepcopy(context["teardown"]),
+                        "expires_at": expires_at,
+                    }
+                )
+            return {"claims": claims}
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
@@ -1076,6 +1198,7 @@ class Service:
             "duration_ms",
             "details",
             "coverage",
+            "claim_id",
         }
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
@@ -1092,6 +1215,13 @@ class Service:
             raise _validation("duration_ms must be an integer")
         if duration_ms < 0:
             raise _validation("duration_ms must be non-negative")
+        provided_claim = False
+        claim_id: str | None = None
+        if "claim_id" in payload:
+            provided_claim = True
+            claim_id = payload["claim_id"]
+            if not isinstance(claim_id, str):
+                raise _validation("claim_id must be a string")
         has_details = "details" in payload
         details = copy.deepcopy(payload.get("details"))
         # Fully validated before any run state is touched, so a malformed
@@ -1108,26 +1238,73 @@ class Service:
                 raise ApiError(
                     409, "run_completed", f"run {run_id!r} is already completed"
                 )
-            instance = next(
+            index = next(
                 (
-                    item
-                    for item in run["instances"]
+                    idx
+                    for idx, item in enumerate(run["instances"])
                     if item["instance_id"] == instance_id
                 ),
                 None,
             )
-            if instance is None:
+            if index is None:
                 raise ApiError(
                     404,
                     "instance_not_found",
                     f"instance {instance_id!r} not found in run {run_id!r}",
                 )
-            if instance["outcome"] != "pending":
-                raise ApiError(
-                    409,
-                    "result_exists",
-                    f"instance {instance_id!r} already has a result",
+            instance = run["instances"][index]
+
+            # Lease enforcement. A live lease can only exist on a pending
+            # instance (leases are created exclusively for pending instances
+            # and consumed together with the result), so every check below
+            # runs before any result is written.
+            now_ms = self._clock()
+            if provided_claim:
+                record = run["claims"].get(claim_id)
+                token_live = (
+                    record is not None
+                    and not record["consumed"]
+                    and record["expires_at"] > now_ms
                 )
+                if token_live and record["instance_index"] == index:
+                    active = record
+                elif token_live:
+                    # The token is a valid lease, just for another instance.
+                    raise ApiError(
+                        409,
+                        "claim_conflict",
+                        f"claim {claim_id!r} leases another instance",
+                    )
+                else:
+                    # Unknown, expired or already consumed. This takes
+                    # precedence over result_exists so reusing a consumed
+                    # token reports claim_not_active.
+                    raise ApiError(
+                        409,
+                        "claim_not_active",
+                        f"claim {claim_id!r} is not active",
+                    )
+            else:
+                if instance["outcome"] != "pending":
+                    raise ApiError(
+                        409,
+                        "result_exists",
+                        f"instance {instance_id!r} already has a result",
+                    )
+                active = self._active_claim(run, index, now_ms)
+                if active is not None:
+                    raise ApiError(
+                        409,
+                        "claim_conflict",
+                        f"instance {instance_id!r} is leased by another worker",
+                    )
+                # No live lease on the instance and no claim presented: the
+                # legacy direct-submission path is preserved.
+
+            # Consume the lease and write the result atomically; nothing past
+            # this point can fail, so coverage and the result stay in sync.
+            if active is not None:
+                active["consumed"] = True
             instance["outcome"] = outcome
             instance["duration_ms"] = duration_ms
             if has_details:
@@ -1228,6 +1405,8 @@ class Service:
                 "retry_of": source_run_id,
                 "root_run_id": root_run_id,
                 "attempt": attempt,
+                "claims": {},
+                "instance_claims": {},
             }
             self._runs[run_id] = run
             return self._run_report(run)
