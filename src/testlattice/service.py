@@ -23,6 +23,7 @@ MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
+RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -809,6 +810,88 @@ class Service:
             run["status"] = "completed"
             return self._run_report(run)
 
+    def create_retry_run(self, source_run_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"id", "outcomes"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "id" not in payload:
+            raise _validation("id is required")
+
+        run_id = _clean_text(payload["id"], "id")
+        if "outcomes" in payload and payload["outcomes"] is not None:
+            outcomes = self._validate_retry_outcomes(payload["outcomes"])
+        else:
+            outcomes = list(RETRY_OUTCOMES)
+
+        with self._lock:
+            source = self._runs.get(source_run_id)
+            if source is None:
+                raise ApiError(
+                    404, "run_not_found", f"run {source_run_id!r} not found"
+                )
+            if source["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {source_run_id!r} is not completed"
+                )
+
+            wanted = set(outcomes)
+            # Keep the source's frozen order; instances are copied without
+            # their previous outcome, duration or details.
+            instances: list[dict] = []
+            for item in source["instances"]:
+                if item["outcome"] not in wanted:
+                    continue
+                instances.append(
+                    {
+                        "instance_id": item["instance_id"],
+                        "case_id": item["case_id"],
+                        "case_name": item["case_name"],
+                        "parameters": copy.deepcopy(item["parameters"]),
+                        "outcome": "pending",
+                    }
+                )
+            if not instances:
+                raise ApiError(
+                    409,
+                    "retry_not_needed",
+                    f"run {source_run_id!r} has no instances with outcome: "
+                    f"{', '.join(outcomes)}",
+                )
+            if run_id in self._runs:
+                raise ApiError(409, "run_exists", f"run {run_id!r} already exists")
+
+            attempt = source.get("attempt", 0) + 1
+            root_run_id = source.get("root_run_id", source_run_id)
+            run = {
+                "id": run_id,
+                "status": "open",
+                "instances": instances,
+                "retry_of": source_run_id,
+                "root_run_id": root_run_id,
+                "attempt": attempt,
+            }
+            self._runs[run_id] = run
+            return self._run_report(run)
+
+    @staticmethod
+    def _validate_retry_outcomes(value: object) -> list[str]:
+        if not isinstance(value, list):
+            raise _validation("outcomes must be an array")
+        if not value:
+            raise _validation("outcomes must not be empty")
+        outcomes: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str) or item not in RETRY_OUTCOMES:
+                raise _validation(
+                    f"outcomes[{index}] must be one of: {', '.join(RETRY_OUTCOMES)}"
+                )
+            if item in outcomes:
+                raise _validation("outcomes must not contain duplicates")
+            outcomes.append(item)
+        return outcomes
+
     @staticmethod
     def _run_report(run: dict) -> dict:
         summary = {
@@ -830,10 +913,15 @@ class Service:
             and summary["failed"] == 0
             and summary["error"] == 0
         )
-        return {
+        report = {
             "id": run["id"],
             "status": run["status"],
             "passed": passed,
             "instances": copy.deepcopy(run["instances"]),
             "summary": summary,
         }
+        if "attempt" in run:
+            report["retry_of"] = run["retry_of"]
+            report["root_run_id"] = run["root_run_id"]
+            report["attempt"] = run["attempt"]
+        return report

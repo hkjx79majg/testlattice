@@ -265,6 +265,10 @@ class Handler(BaseHTTPRequestHandler):
         if run_id is not None:
             self.handle_complete_run(run_id)
             return
+        run_id = _subresource(parts.path, "/v1/runs/", "/retry")
+        if run_id is not None:
+            self.handle_retry_run(run_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_create_suite(self) -> None:
@@ -347,6 +351,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_api_error(error)
             return
         self.send_json(200, report)
+
+    def handle_retry_run(self, run_id: str) -> None:
+        try:
+            payload = self.read_body()
+            report = self.service.create_retry_run(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, report)
 
     # -- DELETE ---------------------------------------------------------
 

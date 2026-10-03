@@ -84,6 +84,14 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 禁用用例、运行 `id` 冲突、重复结果、仍有 pending 时完成分别返回 409 `case_disabled`、`run_exists`、`result_exists`、`run_incomplete`；重复完成或完成后提交返回 409 `run_completed`。
 - 失败请求不留下运行或部分结果。
 
+对已完成运行可调用 `POST /v1/runs/{run_id}/retry` 创建重试运行：请求体含 `id`（沿用运行标识的去空白、非空、唯一规则）与可选 `outcomes`（缺省或为 `null` 时取 `["failed","error"]`；显式提供时须为非空、无重复的数组，成员只能是 `failed` 或 `error`）。服务按源报告的冻结顺序选出结果匹配的实例，不重新读取目录、不重新展开参数化，即使对应用例已删除、禁用或修改，也保留实例的 `instance_id`、`case_name` 与 `parameters`；新实例的 `outcome` 重置为 `pending`，且不复制 `duration_ms` 与 `details`。成功返回 201 及 `open` 状态的报告，初始 `summary` 的 `total` 与 `pending` 等于所选数量，其余计数与 `duration_ms` 均为零。
+
+重试运行复用现有结果提交与完成入口，摘要、`passed` 判定及单实例只能提交一次结果的语义不变。重试报告额外返回 `retry_of`（直接源运行 id）、`root_run_id`（链上最初的普通运行 id）与 `attempt`（首次重试为 1，再次重试在直接源的 attempt 上加一）；普通运行报告不含这些字段。再次重试仅依据直接源运行的最终结果筛选；同一源运行用不同新 id 重试将形成互不影响的分支。
+
+- 源运行不存在返回 404 `run_not_found`；源运行尚未完成返回 409 `run_incomplete`；筛选后无实例返回 409 `retry_not_needed`；新 `id` 已存在返回 409 `run_exists`。
+- 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `id`、未知字段或 `outcomes` 的类型、成员、空值与重复性不合约束返回 400 `validation_error`。
+- 任何失败都不占用新 id，也不留下部分运行。
+
 ## 验证
 
 ```bash
