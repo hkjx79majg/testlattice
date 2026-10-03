@@ -20,6 +20,9 @@ DEFAULT_TIMEOUT_SECONDS = 300
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 86400
 MAX_INSTANCES = 1000
+MAX_RUN_CASES = 100
+MAX_RUN_INSTANCES = 5000
+ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -205,6 +208,7 @@ class Service:
         self._cases: dict[str, dict] = {}
         self._fixtures: dict[str, dict] = {}
         self._snapshots: dict[str, dict] = {}
+        self._runs: dict[str, dict] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -669,3 +673,167 @@ class Service:
             expected = copy.deepcopy(snapshot["value"])
         result = compare_values(expected, actual, ignored)
         return {"snapshot_id": snapshot_id, **result}
+
+    # -- runs -------------------------------------------------------------
+
+    def create_run(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"id", "case_ids"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "id" not in payload:
+            raise _validation("id is required")
+        if "case_ids" not in payload:
+            raise _validation("case_ids is required")
+
+        run_id = _clean_text(payload["id"], "id")
+        case_ids = _validate_references(payload["case_ids"], "case_ids")
+        if not 1 <= len(case_ids) <= MAX_RUN_CASES:
+            raise _validation(
+                f"case_ids must contain between 1 and {MAX_RUN_CASES} entries"
+            )
+
+        with self._lock:
+            if run_id in self._runs:
+                raise ApiError(409, "run_exists", f"run {run_id!r} already exists")
+            # Freeze case names, instance ids and parameters at creation time;
+            # later catalog changes must not affect the recorded run.
+            instances: list[dict] = []
+            for case_id in case_ids:
+                case = self._cases.get(case_id)
+                if case is None:
+                    raise ApiError(
+                        404, "case_not_found", f"case {case_id!r} not found"
+                    )
+                if not case["enabled"]:
+                    raise ApiError(
+                        409, "case_disabled", f"case {case_id!r} is disabled"
+                    )
+                parameters = _expand_parameterization(case.get("parameterization"))
+                for index, values in enumerate(parameters):
+                    instances.append(
+                        {
+                            "instance_id": f"{case_id}[{index}]",
+                            "case_id": case_id,
+                            "case_name": case["name"],
+                            "parameters": copy.deepcopy(values),
+                            "outcome": "pending",
+                        }
+                    )
+            if len(instances) > MAX_RUN_INSTANCES:
+                raise _validation(
+                    f"run expands to {len(instances)} instances; "
+                    f"limit is {MAX_RUN_INSTANCES}"
+                )
+            run = {"id": run_id, "status": "open", "instances": instances}
+            self._runs[run_id] = run
+            return self._run_report(run)
+
+    def get_run(self, run_id: str) -> dict:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            return self._run_report(run)
+
+    def submit_result(self, run_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"instance_id", "outcome", "duration_ms", "details"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("instance_id", "outcome", "duration_ms"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+
+        instance_id = _reference(payload["instance_id"], "instance_id")
+        outcome = payload["outcome"]
+        if not isinstance(outcome, str) or outcome not in ALLOWED_OUTCOMES:
+            raise _validation(f"outcome must be one of: {', '.join(ALLOWED_OUTCOMES)}")
+        duration_ms = payload["duration_ms"]
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int):
+            raise _validation("duration_ms must be an integer")
+        if duration_ms < 0:
+            raise _validation("duration_ms must be non-negative")
+        has_details = "details" in payload
+        details = copy.deepcopy(payload.get("details"))
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            instance = next(
+                (
+                    item
+                    for item in run["instances"]
+                    if item["instance_id"] == instance_id
+                ),
+                None,
+            )
+            if instance is None:
+                raise ApiError(
+                    404,
+                    "instance_not_found",
+                    f"instance {instance_id!r} not found in run {run_id!r}",
+                )
+            if instance["outcome"] != "pending":
+                raise ApiError(
+                    409,
+                    "result_exists",
+                    f"instance {instance_id!r} already has a result",
+                )
+            instance["outcome"] = outcome
+            instance["duration_ms"] = duration_ms
+            if has_details:
+                instance["details"] = details
+            return self._run_report(run)
+
+    def complete_run(self, run_id: str) -> dict:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            if any(item["outcome"] == "pending" for item in run["instances"]):
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} still has pending instances"
+                )
+            run["status"] = "completed"
+            return self._run_report(run)
+
+    @staticmethod
+    def _run_report(run: dict) -> dict:
+        summary = {
+            "total": len(run["instances"]),
+            "pending": 0,
+            "passed": 0,
+            "failed": 0,
+            "error": 0,
+            "skipped": 0,
+            "duration_ms": 0,
+        }
+        for instance in run["instances"]:
+            outcome = instance["outcome"]
+            summary[outcome] += 1
+            if outcome != "pending":
+                summary["duration_ms"] += instance["duration_ms"]
+        passed = (
+            run["status"] == "completed"
+            and summary["failed"] == 0
+            and summary["error"] == 0
+        )
+        return {
+            "id": run["id"],
+            "status": run["status"],
+            "passed": passed,
+            "instances": copy.deepcopy(run["instances"]),
+            "summary": summary,
+        }

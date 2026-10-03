@@ -121,6 +121,10 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_id is not None:
             self.handle_get_snapshot(snapshot_id)
             return
+        run_id = _resource_id(path, "/v1/runs/")
+        if run_id is not None:
+            self.handle_get_run(run_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_get_suite(self, suite_id: str) -> None:
@@ -165,6 +169,12 @@ class Handler(BaseHTTPRequestHandler):
     def handle_get_snapshot(self, snapshot_id: str) -> None:
         try:
             self.send_json(200, self.service.get_snapshot(snapshot_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_get_run(self, run_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_run(run_id))
         except ApiError as error:
             self.send_api_error(error)
 
@@ -244,6 +254,17 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_id is not None:
             self.handle_compare_snapshot(snapshot_id)
             return
+        if parts.path == "/v1/runs":
+            self.handle_create_run()
+            return
+        run_id = _subresource(parts.path, "/v1/runs/", "/results")
+        if run_id is not None:
+            self.handle_submit_result(run_id)
+            return
+        run_id = _subresource(parts.path, "/v1/runs/", "/complete")
+        if run_id is not None:
+            self.handle_complete_run(run_id)
+            return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def handle_create_suite(self) -> None:
@@ -300,6 +321,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_api_error(error)
             return
         self.send_json(200, result)
+
+    def handle_create_run(self) -> None:
+        try:
+            payload = self.read_body()
+            run = self.service.create_run(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, run)
+
+    def handle_submit_result(self, run_id: str) -> None:
+        try:
+            payload = self.read_body()
+            report = self.service.submit_result(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, report)
+
+    def handle_complete_run(self, run_id: str) -> None:
+        try:
+            report = self.service.complete_run(run_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, report)
 
     # -- DELETE ---------------------------------------------------------
 

@@ -73,6 +73,17 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 成功返回 200：`{"snapshot_id", "passed", "summary", "differences"}`，`summary` 含 `total` 及 `value_mismatch`、`missing_actual`、`unexpected_actual` 三个计数，仅无差异时 `passed` 为 `true`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体类型错误、字段缺失或未知、`ignore_paths` 类型错误、指针非法或重复返回 400 `validation_error`。
 
+## 运行记录
+
+进程内保存运行（run）记录，重启后清空。`POST /v1/runs` 接收 `id`（去除首尾空白后须非空、唯一）与 `case_ids`（按声明顺序 1 至 100 个不重复的现有启用用例），创建时依次冻结每个用例的名称及其实例标识与参数，目录后续变化不影响记录；单次运行的总实例数上限为 5000。创建成功返回 201 及状态为 `open` 的完整报告，`GET /v1/runs/{run_id}` 返回同一报告。
+
+外部运行器通过 `POST /v1/runs/{run_id}/results` 逐项提交结果：`instance_id`、`outcome`（`passed`/`failed`/`error`/`skipped`）、`duration_ms`（非负整数）与可选 `details`（任意 JSON 值）；实例须属于该运行且只能提交一次。报告中的 `instances` 按冻结顺序输出，未提交项 `outcome` 为 `pending`，已提交项携带原结果；`summary` 含 `total`、`pending`、`passed`、`failed`、`error`、`skipped` 与 `duration_ms`，时长仅累计已提交项。`POST /v1/runs/{run_id}/complete` 仅在没有 pending 实例时将状态改为 `completed` 并返回 200 报告；`passed` 仅在已完成且 `failed` 与 `error` 均为零时为 `true`，`open` 时为 `false`。
+
+- 畸形 JSON 返回 400 `invalid_json`；未知字段、字段类型或取值错误、重复 `case_ids`、实例超限返回 400 `validation_error`。
+- 用例、运行或运行内实例不存在分别返回 404 `case_not_found`、`run_not_found`、`instance_not_found`。
+- 禁用用例、运行 `id` 冲突、重复结果、仍有 pending 时完成分别返回 409 `case_disabled`、`run_exists`、`result_exists`、`run_incomplete`；重复完成或完成后提交返回 409 `run_completed`。
+- 失败请求不留下运行或部分结果。
+
 ## 验证
 
 ```bash
