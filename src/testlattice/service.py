@@ -738,6 +738,23 @@ class Service:
                 raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
             return self._run_report(run)
 
+    def export_junit(self, run_id: str) -> str:
+        """Render a completed run as JUnit XML without mutating any state."""
+        from .junit import render_junit_report
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            # Build from the frozen report (deep copies); the stored run and
+            # any retry metadata stay untouched.
+            report = self._run_report(run)
+        return render_junit_report(report)
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")

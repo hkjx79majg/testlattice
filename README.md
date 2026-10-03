@@ -96,6 +96,18 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 源运行不存在返回 404 `run_not_found`；源运行尚未完成返回 409 `run_incomplete`；筛选后没有可重试实例返回 409 `retry_not_needed`；新 `id` 已存在返回 409 `run_exists`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体不是对象、缺少 `id`、含未知字段，或 `outcomes` 的类型、成员、空值与重复性不符合约束时返回 400 `validation_error`。任何失败都不占用新 `id`，也不留下部分运行。
 
+### JUnit XML 导出
+
+`GET /v1/runs/{run_id}/junit.xml` 将**已完成**运行确定性导出为 CI 可消费的 JUnit XML（200，`Content-Type: application/xml; charset=utf-8`，UTF-8 正文，含 XML 声明，根元素为 `testsuite`）。同一运行未改变时多次导出的正文逐字节一致；导出不修改运行、目录或重试数据。
+
+- `testsuite` 的 `name` 为 `testlattice.{run_id}`，`tests`/`failures`/`errors`/`skipped` 取报告总数及对应计数，`time` 为各实例 `duration_ms` 之和换算的秒数，固定三位小数（不使用墙钟）；`skipped` 计入 `tests` 与 `skipped`，不计入 `failures` 或 `errors`。
+- `testcase` 按冻结顺序生成，`classname` 为 `case_id`、`name` 为 `instance_id`、`time` 同样固定三位；套件 `time` 恒等于各 `testcase` 的 `time` 之和。
+- 每个 `testcase` 的 `properties` 先写 `case_name`，再按参数名 Unicode 码点顺序写 `parameter.{name}`；属性值使用紧凑 JSON（字符串保留 JSON 引号，非 ASCII 不转义）。
+- `passed` 不带结果子元素；`failed`/`error`/`skipped` 分别带 `failure`/`error`/`skipped`，前两者的 `message` 属性分别为 `failed` 与 `error`。`details` 存在时，对象键按 Unicode 码点递归排序，序列化为无多余空白且非 ASCII 不转义的 JSON 后写入结果子元素文本；缺省时文本为空。
+- 重试运行还在 `testsuite` 的 `properties` 中依次写 `retry_of`、`root_run_id`、`attempt`（值同样为紧凑 JSON），普通运行不写该 `properties`。
+- 所有文本与属性均正确 XML 转义。
+- 运行不存在返回 404 `run_not_found`；运行尚未完成（`open`）返回 409 `run_incomplete`；错误响应保持既有 JSON 结构与 `application/json`，未知路由仍为 404 `not_found`。
+
 ## 验证
 
 ```bash

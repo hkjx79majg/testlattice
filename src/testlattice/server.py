@@ -59,6 +59,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def send_xml(self, body: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def send_error_body(self, status: int, code: str, message: str) -> None:
         self.send_json(status, {"error": {"code": code, "message": message}})
 
@@ -121,6 +129,10 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_id is not None:
             self.handle_get_snapshot(snapshot_id)
             return
+        run_id = _subresource(path, "/v1/runs/", "/junit.xml")
+        if run_id is not None:
+            self.handle_get_run_junit(run_id)
+            return
         run_id = _resource_id(path, "/v1/runs/")
         if run_id is not None:
             self.handle_get_run(run_id)
@@ -177,6 +189,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.get_run(run_id))
         except ApiError as error:
             self.send_api_error(error)
+
+    def handle_get_run_junit(self, run_id: str) -> None:
+        try:
+            body = self.service.export_junit(run_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_xml(body)
 
     def handle_list_cases(self, query: str) -> None:
         try:
