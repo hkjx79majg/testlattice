@@ -73,6 +73,26 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 成功返回 200：`{"snapshot_id", "passed", "summary", "differences"}`，`summary` 含 `total` 及 `value_mismatch`、`missing_actual`、`unexpected_actual` 三个计数，仅无差异时 `passed` 为 `true`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体类型错误、字段缺失或未知、`ignore_paths` 类型错误、指针非法或重复返回 400 `validation_error`。
 
+## 进程内运行记录
+
+运行记录进程内保存、重启清空。`POST /v1/runs` 创建运行（201），`GET /v1/runs/{run_id}` 读取同一报告（200）；不存在集合列表入口，`GET /v1/runs` 返回 404 `not_found`。
+
+- 创建请求只含 `id`（去除首尾空白后须非空、唯一）与 `case_ids`（按声明顺序 1 至 100 个非空字符串，不可重复）；引用的用例必须存在且处于启用状态。
+- 创建时按 `case_ids` 声明顺序、各用例内按实例展开顺序冻结用例名称、实例标识（`用例id[序号]`）与参数；之后目录的重命名、删除、重建或参数化变化不影响已创建的运行。冻结实例总数上限为 5000，超限返回 400 `validation_error` 且不留下运行。
+- 报告为 `{"id", "status", "passed", "summary", "instances"}`：创建后 `status` 为 `open`。`instances` 按冻结顺序输出，每项含 `instance_id`、`case_id`、`name`、`parameters` 与 `status`；未提交结果的实例 `status` 为 `pending`，已提交实例的 `status` 即其结果，并额外携带原 `outcome`、`duration_ms` 及可选 `details`。
+- `summary` 含 `total`、`pending`、`passed`、`failed`、`error`、`skipped` 与 `duration_ms`，`duration_ms` 仅累计已提交实例。
+- 未知用例返回 404 `case_not_found`，禁用用例返回 409 `case_disabled`，运行 `id` 冲突返回 409 `run_exists`，读取未知运行返回 404 `run_not_found`。
+
+外部运行器通过 `POST /v1/runs/{run_id}/results` 逐项提交结果（200 返回当前报告）。请求只含 `instance_id`（非空字符串）、`outcome`（只能是 `passed`、`failed`、`error`、`skipped`）、`duration_ms`（非负整数，布尔值不接受）与可选 `details`（任意 JSON 值，包括 `null`；缺省时实例不携带该字段）。
+
+- 实例必须属于该运行（属于其他运行或运行中根本不存在的实例标识均算不存在），且只能提交一次。
+- 运行不存在返回 404 `run_not_found`，运行内实例不存在返回 404 `instance_not_found`，重复提交返回 409 `result_exists`，运行完成后提交返回 409 `run_completed`。
+- 畸形 JSON 返回 400 `invalid_json`；字段缺失、未知字段、类型或取值错误返回 400 `validation_error`，失败请求不留下任何部分结果。
+
+`POST /v1/runs/{run_id}/complete` 不解析请求体：仅当全部实例均已提交时把 `status` 改为 `completed` 并返回 200 报告；运行不存在返回 404 `run_not_found`，仍有 `pending` 实例返回 409 `run_incomplete`，重复完成返回 409 `run_completed`。`passed` 仅在 `status` 为 `completed` 且 `failed` 与 `error` 均为零时为 `true`，`open` 时恒为 `false`。
+
+- 错误统一为 `{"error": {"code", "message"}}`：运行相关错误码为 `invalid_json`/`validation_error`（400）、`case_not_found`/`run_not_found`/`instance_not_found`（404）、`case_disabled`/`run_exists`/`result_exists`/`run_incomplete`/`run_completed`（409）。
+
 ## 验证
 
 ```bash
