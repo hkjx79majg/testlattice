@@ -22,6 +22,7 @@ MAX_TIMEOUT_SECONDS = 86400
 MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
+MAX_AGGREGATE_RUNS = 100
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -195,6 +196,47 @@ def _expand_parameterization(parameterization: dict | None) -> list[dict]:
             ]
         return combinations
     return copy.deepcopy(parameterization["rows"])
+
+
+def _empty_aggregate_summary() -> dict:
+    return {
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0,
+        "duration_ms": 0,
+    }
+
+
+def _accumulate(summary: dict, instance: dict) -> None:
+    summary["total"] += 1
+    summary[instance["outcome"]] += 1
+    summary["duration_ms"] += instance["duration_ms"]
+
+
+def _merge_into(target: dict, source: dict) -> None:
+    for key, value in source.items():
+        target[key] += value
+
+
+def _summary_passed(summary: dict) -> bool:
+    return summary["failed"] == 0 and summary["error"] == 0
+
+
+def _trend(flags: list[bool]) -> str:
+    """Classify the per-run pass/fail sequence of one case."""
+    if len(flags) < 2:
+        return "insufficient"
+    if all(flags):
+        return "stable_pass"
+    if not any(flags):
+        return "stable_fail"
+    if flags[0] and not flags[-1]:
+        return "regression"
+    if not flags[0] and flags[-1]:
+        return "improvement"
+    return "fluctuating"
 
 
 class Service:
@@ -910,6 +952,110 @@ class Service:
                 raise _validation("outcomes must not contain duplicates")
             cleaned.append(item)
         return cleaned
+
+    # -- report aggregation ------------------------------------------------
+
+    def aggregate_reports(self, payload: object) -> dict:
+        """Read-only cross-run aggregation over completed runs.
+
+        Uses only the frozen run records; the catalog is never consulted and
+        nothing is mutated.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"run_ids"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "run_ids" not in payload:
+            raise _validation("run_ids is required")
+        run_ids = _validate_references(payload["run_ids"], "run_ids")
+        if not 1 <= len(run_ids) <= MAX_AGGREGATE_RUNS:
+            raise _validation(
+                f"run_ids must contain between 1 and {MAX_AGGREGATE_RUNS} entries"
+            )
+
+        with self._lock:
+            runs: list[dict] = []
+            for run_id in run_ids:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+                if run["status"] != "completed":
+                    raise ApiError(
+                        409, "run_incomplete", f"run {run_id!r} is not completed"
+                    )
+                runs.append(run)
+
+            total_summary = _empty_aggregate_summary()
+            run_entries: list[dict] = []
+            case_order: list[str] = []
+            case_entries: dict[str, dict] = {}
+
+            for run in runs:
+                run_summary = _empty_aggregate_summary()
+                # Per-case slices of this run, in frozen first-appearance order.
+                slices: dict[str, dict] = {}
+                for instance in run["instances"]:
+                    _accumulate(run_summary, instance)
+                    case_id = instance["case_id"]
+                    slice_ = slices.get(case_id)
+                    if slice_ is None:
+                        slice_ = slices[case_id] = {
+                            "case_name": instance["case_name"],
+                            "summary": _empty_aggregate_summary(),
+                        }
+                    _accumulate(slice_["summary"], instance)
+
+                entry = {
+                    "run_id": run["id"],
+                    "passed": _summary_passed(run_summary),
+                    "summary": run_summary,
+                }
+                if "retry_of" in run:
+                    entry["retry_of"] = run["retry_of"]
+                    entry["root_run_id"] = run["root_run_id"]
+                    entry["attempt"] = run["attempt"]
+                run_entries.append(entry)
+                _merge_into(total_summary, run_summary)
+
+                for case_id, slice_ in slices.items():
+                    case_entry = case_entries.get(case_id)
+                    if case_entry is None:
+                        case_entry = case_entries[case_id] = {
+                            "case_id": case_id,
+                            "summary": _empty_aggregate_summary(),
+                            "runs": [],
+                            "flags": [],
+                        }
+                        case_order.append(case_id)
+                    _merge_into(case_entry["summary"], slice_["summary"])
+                    passed = _summary_passed(slice_["summary"])
+                    case_entry["flags"].append(passed)
+                    case_entry["runs"].append(
+                        {
+                            "run_id": run["id"],
+                            "case_name": slice_["case_name"],
+                            "summary": slice_["summary"],
+                            "passed": passed,
+                        }
+                    )
+
+            cases = [
+                {
+                    "case_id": case_id,
+                    "summary": case_entries[case_id]["summary"],
+                    "trend": _trend(case_entries[case_id]["flags"]),
+                    "runs": case_entries[case_id]["runs"],
+                }
+                for case_id in case_order
+            ]
+            return {
+                "run_count": len(run_entries),
+                "passed": _summary_passed(total_summary),
+                "summary": total_summary,
+                "runs": run_entries,
+                "cases": cases,
+            }
 
     @staticmethod
     def _run_report(run: dict) -> dict:
