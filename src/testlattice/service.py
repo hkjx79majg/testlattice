@@ -12,6 +12,7 @@ import math
 import re
 import threading
 from collections.abc import Mapping
+from decimal import ROUND_HALF_UP, Decimal
 
 from . import __version__
 
@@ -23,6 +24,8 @@ MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
+MAX_COVERAGE_FILES = 1000
+MAX_COVERAGE_EXECUTABLE_LINES = 100000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -83,6 +86,88 @@ def _validate_references(value: object, field: str) -> list[str]:
             raise _validation(f"{field} must not contain duplicates")
         cleaned.append(item)
     return cleaned
+
+
+def _validate_line_numbers(value: object, field: str) -> list[int]:
+    """Line-number arrays: unique positive integers, order preserved."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    cleaned: list[int] = []
+    seen: set[int] = set()
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if item in seen:
+            raise _validation(f"{field} must not contain duplicates")
+        seen.add(item)
+        cleaned.append(item)
+    return cleaned
+
+
+def _validate_coverage(value: object) -> dict:
+    """Validate one instance's coverage fragment: only ``files``, mapping
+    non-empty paths to executable/covered line-number arrays."""
+    if not isinstance(value, dict):
+        raise _validation("coverage must be a JSON object")
+    unknown = set(value) - {"files"}
+    if unknown:
+        raise _validation(f"coverage unknown fields: {', '.join(sorted(unknown))}")
+    if "files" not in value:
+        raise _validation("coverage.files is required")
+    files = value["files"]
+    if not isinstance(files, dict) or not files:
+        raise _validation("coverage.files must be a non-empty object")
+    if len(files) > MAX_COVERAGE_FILES:
+        raise _validation(
+            f"coverage.files must contain at most {MAX_COVERAGE_FILES} files"
+        )
+
+    cleaned: dict[str, dict] = {}
+    total_executable = 0
+    for path, entry in files.items():
+        if not isinstance(path, str) or not path:
+            raise _validation("coverage.files keys must be non-empty file paths")
+        label = f"coverage.files[{path!r}]"
+        if not isinstance(entry, dict):
+            raise _validation(f"{label} must be a JSON object")
+        unknown_entry = set(entry) - {"executable_lines", "covered_lines"}
+        if unknown_entry:
+            raise _validation(
+                f"{label} unknown fields: {', '.join(sorted(unknown_entry))}"
+            )
+        for field in ("executable_lines", "covered_lines"):
+            if field not in entry:
+                raise _validation(f"{label}.{field} is required")
+        executable = _validate_line_numbers(
+            entry["executable_lines"], f"{label}.executable_lines"
+        )
+        if not executable:
+            raise _validation(f"{label}.executable_lines must not be empty")
+        covered = _validate_line_numbers(
+            entry["covered_lines"], f"{label}.covered_lines"
+        )
+        if not set(covered) <= set(executable):
+            raise _validation(
+                f"{label}.covered_lines must be a subset of executable_lines"
+            )
+        total_executable += len(executable)
+        cleaned[path] = {"executable_lines": executable, "covered_lines": covered}
+    if total_executable > MAX_COVERAGE_EXECUTABLE_LINES:
+        raise _validation(
+            f"coverage expands to {total_executable} executable lines; "
+            f"limit is {MAX_COVERAGE_EXECUTABLE_LINES}"
+        )
+    return cleaned
+
+
+def _coverage_percent(covered: int, executable: int) -> float | None:
+    """Round-half-up percentage with two decimals; null when no lines."""
+    if executable == 0:
+        return None
+    value = (Decimal(covered) * 100 / Decimal(executable)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return float(value)
 
 
 def _is_scalar(value: object) -> bool:
@@ -793,10 +878,69 @@ class Service:
                 )
             return self._run_report(run)
 
+    def get_run_coverage(self, run_id: str) -> dict:
+        """Read-only merge of all coverage fragments of a completed run.
+
+        Per path, executable and covered lines are unioned across instances;
+        files are ordered by Unicode code point and line numbers ascend.
+        Nothing in the stored run record is mutated.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            fragments = run.get("coverage", {})
+            merged: dict[str, dict[str, set[int]]] = {}
+            for instance in run["instances"]:
+                fragment = fragments.get(instance["instance_id"])
+                if not fragment:
+                    continue
+                for path, entry in fragment.items():
+                    slot = merged.setdefault(
+                        path, {"executable": set(), "covered": set()}
+                    )
+                    slot["executable"].update(entry["executable_lines"])
+                    slot["covered"].update(entry["covered_lines"])
+
+            files: list[dict] = []
+            total_executable = 0
+            total_covered = 0
+            for path in sorted(merged):
+                executable = sorted(merged[path]["executable"])
+                covered = sorted(merged[path]["covered"])
+                missed = sorted(merged[path]["executable"] - merged[path]["covered"])
+                total_executable += len(executable)
+                total_covered += len(covered)
+                files.append(
+                    {
+                        "path": path,
+                        "executable_lines": executable,
+                        "covered_lines": covered,
+                        "missed_lines": missed,
+                        "coverage_percent": _coverage_percent(
+                            len(covered), len(executable)
+                        ),
+                    }
+                )
+            summary = {
+                "files": len(files),
+                "executable_lines": total_executable,
+                "covered_lines": total_covered,
+                "missed_lines": total_executable - total_covered,
+                "coverage_percent": _coverage_percent(
+                    total_covered, total_executable
+                ),
+            }
+            return {"run_id": run["id"], "summary": summary, "files": files}
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
-        unknown = set(payload) - {"instance_id", "outcome", "duration_ms", "details"}
+        unknown = set(payload) - {"instance_id", "outcome", "duration_ms", "details", "coverage"}
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
         for field in ("instance_id", "outcome", "duration_ms"):
@@ -814,6 +958,10 @@ class Service:
             raise _validation("duration_ms must be non-negative")
         has_details = "details" in payload
         details = copy.deepcopy(payload.get("details"))
+        # Coverage is validated up front so an invalid fragment leaves the
+        # instance pending and stores neither result nor coverage.
+        has_coverage = "coverage" in payload and payload["coverage"] is not None
+        coverage = _validate_coverage(payload["coverage"]) if has_coverage else None
 
         with self._lock:
             run = self._runs.get(run_id)
@@ -847,6 +995,10 @@ class Service:
             instance["duration_ms"] = duration_ms
             if has_details:
                 instance["details"] = details
+            if has_coverage:
+                # Fragments live on the run, keyed by instance id, so the
+                # frozen report, JUnit export and aggregation stay unchanged.
+                run.setdefault("coverage", {})[instance_id] = coverage
             return self._run_report(run)
 
     def complete_run(self, run_id: str) -> dict:

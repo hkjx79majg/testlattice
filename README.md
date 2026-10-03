@@ -118,6 +118,12 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 参数化实例与重复参数行均逐项计数，`skipped` 不算失败。`trend` 依据该用例在各运行中的通过序列：只出现一次为 `insufficient`；多次均通过或均未通过为 `stable_pass`/`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### 行覆盖率提交与合并
+
+`POST /v1/runs/{run_id}/results` 接受可选 `coverage` 字段，使实例结果原子附带行覆盖片段；未提供该字段（或为 `null`）时提交行为与之前完全一致。片段只含 `files`：非空对象，键为非空文件路径，值只含必填的 `executable_lines` 与 `covered_lines`——均为无重复正整数数组，前者非空，后者可为空但必须是前者的子集。单个片段最多 1000 个文件、合计 100000 个可执行行号。片段不合规时整个提交返回 400 `validation_error`，实例保持 `pending`，结果与覆盖数据均不保存；重复提交、完成后提交等既有约束不变。覆盖数据不进入运行报告、JUnit 导出或跨运行聚合。
+
+`GET /v1/runs/{run_id}/coverage` 对**已完成**运行只读合并全部实例片段（200）：相同路径的可执行行与已覆盖行分别取并集，文件按路径 Unicode 码点排序，行号数组升序。每个文件返回 `path`、`executable_lines`、`covered_lines`、`missed_lines`（可执行行减去已覆盖行）与 `coverage_percent`（已覆盖数除以可执行数乘 100，四舍五入到两位小数）。顶层为 `run_id`、`summary`、`files`；`summary` 含 `files`（文件数）、`executable_lines`、`covered_lines`、`missed_lines` 计数及同口径 `coverage_percent`。没有任何覆盖片段时 `files` 为空、各计数为零、`coverage_percent` 为 `null`。重复读取结果顺序稳定且不改变任何数据；重试运行不继承源运行的覆盖片段，只汇总重试实例新提交的数据。运行不存在返回 404 `run_not_found`，尚未完成返回 409 `run_incomplete`。
+
 ## 验证
 
 ```bash
