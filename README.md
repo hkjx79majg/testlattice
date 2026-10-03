@@ -77,7 +77,7 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 进程内保存运行（run）记录，重启后清空。`POST /v1/runs` 接收 `id`（去除首尾空白后须非空、唯一）与 `case_ids`（按声明顺序 1 至 100 个不重复的现有启用用例），创建时依次冻结每个用例的名称及其实例标识与参数，目录后续变化不影响记录；单次运行的总实例数上限为 5000。创建成功返回 201 及状态为 `open` 的完整报告，`GET /v1/runs/{run_id}` 返回同一报告。
 
-外部运行器通过 `POST /v1/runs/{run_id}/results` 逐项提交结果：`instance_id`、`outcome`（`passed`/`failed`/`error`/`skipped`）、`duration_ms`（非负整数）与可选 `details`（任意 JSON 值）；实例须属于该运行且只能提交一次。报告中的 `instances` 按冻结顺序输出，未提交项 `outcome` 为 `pending`，已提交项携带原结果；`summary` 含 `total`、`pending`、`passed`、`failed`、`error`、`skipped` 与 `duration_ms`，时长仅累计已提交项。`POST /v1/runs/{run_id}/complete` 仅在没有 pending 实例时将状态改为 `completed` 并返回 200 报告；`passed` 仅在已完成且 `failed` 与 `error` 均为零时为 `true`，`open` 时为 `false`。
+外部运行器通过 `POST /v1/runs/{run_id}/results` 逐项提交结果：`instance_id`、`outcome`（`passed`/`failed`/`error`/`skipped`）、`duration_ms`（非负整数）与可选 `details`（任意 JSON 值）；实例须属于该运行且只能提交一次。另可携带可选 `coverage` 行覆盖片段，校验规则与合并语义见下文「行覆盖率片段与合并」。报告中的 `instances` 按冻结顺序输出，未提交项 `outcome` 为 `pending`，已提交项携带原结果；运行报告本身不包含任何覆盖数据。`summary` 含 `total`、`pending`、`passed`、`failed`、`error`、`skipped` 与 `duration_ms`，时长仅累计已提交项。`POST /v1/runs/{run_id}/complete` 仅在没有 pending 实例时将状态改为 `completed` 并返回 200 报告；`passed` 仅在已完成且 `failed` 与 `error` 均为零时为 `true`，`open` 时为 `false`。
 
 - 畸形 JSON 返回 400 `invalid_json`；未知字段、字段类型或取值错误、重复 `case_ids`、实例超限返回 400 `validation_error`。
 - 用例、运行或运行内实例不存在分别返回 404 `case_not_found`、`run_not_found`、`instance_not_found`。
@@ -95,6 +95,24 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 重试运行继续复用现有结果提交、完成与读取入口；`summary`、`passed` 判定及单实例只能提交一次结果的语义与普通运行一致。
 - 源运行不存在返回 404 `run_not_found`；源运行尚未完成返回 409 `run_incomplete`；筛选后没有可重试实例返回 409 `retry_not_needed`；新 `id` 已存在返回 409 `run_exists`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体不是对象、缺少 `id`、含未知字段，或 `outcomes` 的类型、成员、空值与重复性不符合约束时返回 400 `validation_error`。任何失败都不占用新 `id`，也不留下部分运行。
+
+### 行覆盖率片段与合并
+
+提交实例结果时可携带可选 `coverage` 字段，与结果原子写入：片段不合规时整个提交返回 400 `validation_error`，实例保持 `pending`，结果与覆盖数据均不保存。`coverage` 只能含 `files` 字段；`files` 是非空对象，键为非空文件路径，值只能包含必填的 `executable_lines` 与 `covered_lines`：
+
+- 两者均为无重复正整数数组；`executable_lines` 不得为空，`covered_lines` 可以为空但必须是 `executable_lines` 的子集；布尔值、非整数、零与负数均不合规。
+- 单个片段最多 1000 个文件，合计最多 100000 个可执行行号（按文件内去重后的数量求和）。
+- 缺省 `coverage` 表示该实例不附带覆盖；显式提供时必须是合规的覆盖对象，`null` 或其他类型均返回 400 `validation_error`。`files` 为空或不是对象、文件值不是对象、缺少任一行号字段、文件条目含未知字段、`coverage` 含 `files` 之外字段、空路径等同样返回 400 `validation_error`。
+- 覆盖片段按运行独立累积，与结果在同一提交内一并写入；片段内文件声明顺序与行号顺序均无语义，存储时按路径与行号归一化，响应对象与提交对象完全隔离。
+
+`GET /v1/runs/{run_id}/coverage` 对**已完成**运行只读合并全部实例片段（200，`application/json; charset=utf-8`），不修改任何数据；重复读取同一运行返回顺序与内容稳定的结果。
+
+- 相同路径的可执行行与已覆盖行分别取并集；文件按路径的 Unicode 码点顺序返回，每个文件的行号数组升序返回。
+- 每个文件含 `path`、`executable_lines`、`covered_lines`、`missed_lines` 与 `coverage_percent`；`missed_lines` 为可执行行减去已覆盖行，百分比为已覆盖数 ÷ 可执行数 × 100 后四舍五入到两位小数（如 `2/3 → 66.67`）。
+- 顶层返回 `run_id`、`summary` 与 `files`；`summary` 含 `files`（文件数）、`executable_lines`、`covered_lines`、`missed_lines` 及同口径 `coverage_percent`。没有任何覆盖片段时 `files` 为空数组、各计数为零、`coverage_percent` 为 `null`。
+- 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`。
+- 重试运行不继承源运行（或任一祖先运行）的覆盖片段，只汇总重试实例在新运行中提交的片段；源运行的覆盖数据不受重试及其后续提交影响。
+- 该入口不改变运行报告结构、完成判定、重试筛选、JUnit XML 导出、跨运行聚合以及目录与快照入口；未知路由仍返回 404 `not_found`。
 
 ### JUnit XML 导出
 

@@ -23,6 +23,8 @@ MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
+MAX_COVERAGE_FILES = 1000
+MAX_COVERAGE_EXECUTABLE_LINES = 100000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -92,6 +94,126 @@ def _is_scalar(value: object) -> bool:
     if isinstance(value, (int, float)):
         return not isinstance(value, float) or math.isfinite(value)
     return False
+
+
+def _validate_line_numbers(value: object, field: str, *, allow_empty: bool) -> list[int]:
+    """Unique positive integers in ascending order; request order is normalized."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    if not allow_empty and not value:
+        raise _validation(f"{field} must not be empty")
+    lines: list[int] = []
+    seen: set[int] = set()
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if item < 1:
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if item in seen:
+            raise _validation(f"{field} must not contain duplicates")
+        seen.add(item)
+        lines.append(item)
+    lines.sort()
+    return lines
+
+
+def _validate_coverage(value: object) -> dict[str, dict[str, list[int]]]:
+    """Validate the optional coverage fragment attached to one instance result.
+
+    Only ``files`` is allowed: a non-empty object keyed by non-empty file
+    paths whose values contain exactly ``executable_lines`` (a non-empty
+    unique positive-int array) and ``covered_lines`` (a possibly empty
+    unique positive-int array that must be a subset). Limited to
+    MAX_COVERAGE_FILES files and MAX_COVERAGE_EXECUTABLE_LINES executable
+    line numbers in total. Stored as normalized {path: {executable,
+    covered}} sets; request file/line order is never significant.
+    """
+    if not isinstance(value, dict):
+        raise _validation("coverage must be a JSON object")
+    unknown = set(value) - {"files"}
+    if unknown:
+        raise _validation(
+            f"coverage unknown fields: {', '.join(sorted(unknown))}"
+        )
+    if "files" not in value:
+        raise _validation("coverage.files is required")
+    files = value["files"]
+    if not isinstance(files, dict) or not files:
+        raise _validation("coverage.files must be a non-empty object")
+    if len(files) > MAX_COVERAGE_FILES:
+        raise _validation(
+            f"coverage must contain at most {MAX_COVERAGE_FILES} files"
+        )
+
+    normalized: dict[str, dict[str, list[int]]] = {}
+    total_executable = 0
+    for path, entry in files.items():
+        if not isinstance(path, str) or path == "":
+            raise _validation("coverage file paths must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise _validation(f"coverage.files.{path} must be a JSON object")
+        entry_unknown = set(entry) - {"executable_lines", "covered_lines"}
+        if entry_unknown:
+            raise _validation(
+                f"coverage.files.{path} unknown fields: "
+                f"{', '.join(sorted(entry_unknown))}"
+            )
+        if "executable_lines" not in entry:
+            raise _validation(
+                f"coverage.files.{path}.executable_lines is required"
+            )
+        if "covered_lines" not in entry:
+            raise _validation(
+                f"coverage.files.{path}.covered_lines is required"
+            )
+        executable = _validate_line_numbers(
+            entry["executable_lines"],
+            f"coverage.files.{path}.executable_lines",
+            allow_empty=False,
+        )
+        covered = _validate_line_numbers(
+            entry["covered_lines"],
+            f"coverage.files.{path}.covered_lines",
+            allow_empty=True,
+        )
+        if not set(covered).issubset(executable):
+            raise _validation(
+                f"coverage.files.{path}.covered_lines must be a subset of "
+                "executable_lines"
+            )
+        total_executable += len(executable)
+        if total_executable > MAX_COVERAGE_EXECUTABLE_LINES:
+            raise _validation(
+                "coverage must contain at most "
+                f"{MAX_COVERAGE_EXECUTABLE_LINES} executable line numbers in total"
+            )
+        normalized[path] = {"executable_lines": executable, "covered_lines": covered}
+    return normalized
+
+
+def _merge_coverage(
+    target: dict[str, dict[str, set[int]]], fragment: dict[str, dict[str, list[int]]]
+) -> None:
+    """Union one validated fragment into the run-level coverage accumulator."""
+    for path, entry in fragment.items():
+        merged = target.get(path)
+        if merged is None:
+            merged = target[path] = {"executable_lines": set(), "covered_lines": set()}
+        merged["executable_lines"].update(entry["executable_lines"])
+        merged["covered_lines"].update(entry["covered_lines"])
+
+
+def _coverage_percent(covered: int, executable: int) -> float:
+    """covered / executable * 100 rounded half-up to two decimals.
+
+    Computed with integer arithmetic so the x.xx5 tie rounds up
+    (四舍五入) rather than following binary/banker's rounding.
+    """
+    hundredths = covered * 10000 // executable
+    remainder = covered * 10000 % executable
+    if remainder * 2 >= executable:
+        hundredths += 1
+    return hundredths / 100
 
 
 def _valid_param_name(name: object) -> bool:
@@ -252,6 +374,8 @@ class Service:
         self._fixtures: dict[str, dict] = {}
         self._snapshots: dict[str, dict] = {}
         self._runs: dict[str, dict] = {}
+        # Run id -> {path: {"executable_lines": set[int], "covered_lines": set[int]}}
+        self._coverage: dict[str, dict[str, dict[str, set[int]]]] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -793,10 +917,74 @@ class Service:
                 )
             return self._run_report(run)
 
+    def get_run_coverage(self, run_id: str) -> dict:
+        """Read-only merged coverage report for a completed run.
+
+        Unions the executable and covered line sets of every fragment
+        submitted to this run; nothing is mutated, so repeated reads of the
+        same completed run return byte-identical order and counts.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            accumulated = self._coverage.get(run_id, {})
+
+            files: list[dict] = []
+            total_executable = 0
+            total_covered = 0
+            for path in sorted(accumulated):
+                entry = accumulated[path]
+                executable = sorted(entry["executable_lines"])
+                covered_set = entry["covered_lines"]
+                covered = [line for line in executable if line in covered_set]
+                missed = [line for line in executable if line not in covered_set]
+                files.append(
+                    {
+                        "path": path,
+                        "executable_lines": executable,
+                        "covered_lines": covered,
+                        "missed_lines": missed,
+                        "coverage_percent": _coverage_percent(
+                            len(covered), len(executable)
+                        ),
+                    }
+                )
+                total_executable += len(executable)
+                total_covered += len(covered)
+
+            total_missed = total_executable - total_covered
+            percent = (
+                _coverage_percent(total_covered, total_executable)
+                if total_executable
+                else None
+            )
+            return {
+                "run_id": run_id,
+                "summary": {
+                    "files": len(files),
+                    "executable_lines": total_executable,
+                    "covered_lines": total_covered,
+                    "missed_lines": total_missed,
+                    "coverage_percent": percent,
+                },
+                "files": files,
+            }
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
-        unknown = set(payload) - {"instance_id", "outcome", "duration_ms", "details"}
+        unknown = set(payload) - {
+            "instance_id",
+            "outcome",
+            "duration_ms",
+            "details",
+            "coverage",
+        }
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
         for field in ("instance_id", "outcome", "duration_ms"):
@@ -814,6 +1002,11 @@ class Service:
             raise _validation("duration_ms must be non-negative")
         has_details = "details" in payload
         details = copy.deepcopy(payload.get("details"))
+        # Fully validated before any run state is touched, so a malformed
+        # fragment leaves both the result and coverage unwritten.
+        coverage = (
+            _validate_coverage(payload["coverage"]) if "coverage" in payload else None
+        )
 
         with self._lock:
             run = self._runs.get(run_id)
@@ -847,6 +1040,9 @@ class Service:
             instance["duration_ms"] = duration_ms
             if has_details:
                 instance["details"] = details
+            if coverage is not None:
+                accumulated = self._coverage.setdefault(run_id, {})
+                _merge_coverage(accumulated, coverage)
             return self._run_report(run)
 
     def complete_run(self, run_id: str) -> dict:
