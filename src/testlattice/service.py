@@ -10,7 +10,9 @@ from __future__ import annotations
 import copy
 import math
 import re
+import secrets
 import threading
+import time
 from collections.abc import Mapping
 
 from . import __version__
@@ -25,6 +27,10 @@ MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
 MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
+DEFAULT_CLAIM_MAX_ITEMS = 1
+MAX_CLAIM_ITEMS = 100
+MIN_LEASE_SECONDS = 1
+MAX_LEASE_SECONDS = 3600
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -52,6 +58,11 @@ def _clean_text(value: object, field: str) -> str:
     if not cleaned:
         raise _validation(f"{field} must not be empty")
     return cleaned
+
+
+def _now_ms() -> int:
+    """Current wall-clock time as an integer number of epoch milliseconds."""
+    return time.time_ns() // 1_000_000
 
 
 def _reference(value: object, field: str) -> str:
@@ -1067,6 +1078,104 @@ class Service:
                 report["attempt"] = run["attempt"]
             return report
 
+    # -- leases / claims --------------------------------------------------
+
+    @staticmethod
+    def _lease_active(lease: object, now_ms: int) -> bool:
+        """A lease is valid until (but not once) current time reaches expiry."""
+        return isinstance(lease, dict) and not lease.get("consumed") and lease["expires_at"] > now_ms
+
+    def _drop_expired_leases(self, run: dict, now_ms: int) -> None:
+        """Expired leases vanish silently; the instances stay pending and
+        carry no result, duration or coverage, and become claimable again."""
+        for instance in run["instances"]:
+            lease = instance.get("lease")
+            if lease is not None and not self._lease_active(lease, now_ms):
+                instance.pop("lease", None)
+
+    @staticmethod
+    def _claim_view(instance: dict, context: dict, lease: dict) -> dict:
+        return {
+            "claim_id": lease["claim_id"],
+            "instance_id": copy.deepcopy(instance["instance_id"]),
+            "case_id": copy.deepcopy(instance["case_id"]),
+            "case_name": copy.deepcopy(instance["case_name"]),
+            "kind": copy.deepcopy(context["kind"]),
+            "parameters": copy.deepcopy(instance["parameters"]),
+            "timeout_seconds": context["timeout_seconds"],
+            "setup": copy.deepcopy(context["setup"]),
+            "steps": copy.deepcopy(context["steps"]),
+            "teardown": copy.deepcopy(context["teardown"]),
+            "expires_at": lease["expires_at"],
+        }
+
+    def claim_instances(self, run_id: str, payload: object) -> dict:
+        """Lease pending instances of one run to one worker.
+
+        Selection follows frozen order and skips every instance that still
+        holds an unexpired, unconsumed lease. The whole scan-and-lease step
+        runs under the service lock, so concurrent claims can never attach
+        two active leases to the same instance.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"worker_id", "max_items", "lease_seconds"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "worker_id" not in payload:
+            raise _validation("worker_id is required")
+        worker_id = _clean_text(payload["worker_id"], "worker_id")
+
+        max_items = DEFAULT_CLAIM_MAX_ITEMS
+        if "max_items" in payload:
+            value = payload["max_items"]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _validation("max_items must be an integer")
+            if not 1 <= value <= MAX_CLAIM_ITEMS:
+                raise _validation(
+                    f"max_items must be between 1 and {MAX_CLAIM_ITEMS}"
+                )
+            max_items = value
+
+        if "lease_seconds" not in payload:
+            raise _validation("lease_seconds is required")
+        lease_seconds = payload["lease_seconds"]
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise _validation("lease_seconds must be an integer")
+        if not MIN_LEASE_SECONDS <= lease_seconds <= MAX_LEASE_SECONDS:
+            raise _validation(
+                f"lease_seconds must be between {MIN_LEASE_SECONDS} and {MAX_LEASE_SECONDS}"
+            )
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            now_ms = _now_ms()
+            self._drop_expired_leases(run, now_ms)
+            expires_at = now_ms + lease_seconds * 1000
+
+            claims: list[dict] = []
+            for instance, context in zip(run["instances"], run["contexts"]):
+                if len(claims) >= max_items:
+                    break
+                if instance["outcome"] != "pending" or "lease" in instance:
+                    continue
+                claim_id = secrets.token_urlsafe(18)
+                lease = {
+                    "claim_id": claim_id,
+                    "worker_id": worker_id,
+                    "expires_at": expires_at,
+                    "consumed": False,
+                }
+                instance["lease"] = lease
+                claims.append(self._claim_view(instance, context, lease))
+            return {"claims": claims}
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
@@ -1076,6 +1185,7 @@ class Service:
             "duration_ms",
             "details",
             "coverage",
+            "claim_id",
         }
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
@@ -1092,6 +1202,10 @@ class Service:
             raise _validation("duration_ms must be an integer")
         if duration_ms < 0:
             raise _validation("duration_ms must be non-negative")
+        has_claim = "claim_id" in payload
+        claim_id = payload.get("claim_id")
+        if has_claim:
+            claim_id = _reference(claim_id, "claim_id")
         has_details = "details" in payload
         details = copy.deepcopy(payload.get("details"))
         # Fully validated before any run state is touched, so a malformed
@@ -1122,12 +1236,55 @@ class Service:
                     "instance_not_found",
                     f"instance {instance_id!r} not found in run {run_id!r}",
                 )
+            now_ms = _now_ms()
+            self._drop_expired_leases(run, now_ms)
+            lease = instance.get("lease")
+            if lease is not None:
+                # A leased instance only accepts its own live claim. Offering
+                # another still-active lease (of any instance in the run) is
+                # a conflict; expired/consumed/unknown/foreign ids are simply
+                # not active.
+                if not has_claim:
+                    raise ApiError(
+                        409,
+                        "claim_conflict",
+                        f"instance {instance_id!r} is held by an active claim",
+                    )
+                if claim_id != lease["claim_id"]:
+                    other_active = any(
+                        other is not instance
+                        and isinstance(other.get("lease"), dict)
+                        and other["lease"]["claim_id"] == claim_id
+                        for other in run["instances"]
+                    )
+                    if other_active:
+                        raise ApiError(
+                            409,
+                            "claim_conflict",
+                            f"claim {claim_id!r} is active for another instance",
+                        )
+                    raise ApiError(
+                        409,
+                        "claim_not_active",
+                        f"claim {claim_id!r} is not active for instance {instance_id!r}",
+                    )
+            elif has_claim:
+                raise ApiError(
+                    409,
+                    "claim_not_active",
+                    f"claim {claim_id!r} is not active for instance {instance_id!r}",
+                )
             if instance["outcome"] != "pending":
                 raise ApiError(
                     409,
                     "result_exists",
                     f"instance {instance_id!r} already has a result",
                 )
+            # Consume the lease and write the result atomically: a failed
+            # request above leaves both the lease and the instance untouched.
+            if lease is not None:
+                lease["consumed"] = True
+                instance.pop("lease", None)
             instance["outcome"] = outcome
             instance["duration_ms"] = duration_ms
             if has_details:
@@ -1364,11 +1521,20 @@ class Service:
             "skipped": 0,
             "duration_ms": 0,
         }
+        public_instances: list[dict] = []
         for instance in run["instances"]:
             outcome = instance["outcome"]
             summary[outcome] += 1
             if outcome != "pending":
                 summary["duration_ms"] += instance["duration_ms"]
+            # Leases are internal scheduling state and never appear in reports.
+            public_instances.append(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in instance.items()
+                    if key != "lease"
+                }
+            )
         passed = (
             run["status"] == "completed"
             and summary["failed"] == 0
@@ -1378,7 +1544,7 @@ class Service:
             "id": run["id"],
             "status": run["status"],
             "passed": passed,
-            "instances": copy.deepcopy(run["instances"]),
+            "instances": public_instances,
             "summary": summary,
         }
         if "retry_of" in run:
