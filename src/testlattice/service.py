@@ -738,6 +738,19 @@ class Service:
                 raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
             return self._run_report(run)
 
+    def get_run_junit(self, run_id: str) -> dict:
+        """Return the frozen report for a completed run; rendering happens in
+        the caller so the stored record is never mutated."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            return self._run_report(run)
+
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
