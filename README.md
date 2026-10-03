@@ -136,6 +136,16 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 参数化实例与重复参数行均逐项计数，`skipped` 不算失败。`trend` 依据该用例在各运行中的通过序列：只出现一次为 `insufficient`；多次均通过或均未通过为 `stable_pass`/`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### 失败诊断导出
+
+`GET /v1/runs/{run_id}/diagnostics` 将**已完成**运行的失败上下文确定性导出为 JSON（200）。创建普通运行时，服务在内部为每个实例冻结当时的 `kind`、`timeout_seconds`、用例 `steps`，以及按执行计划语义展开的 `setup` 与 `teardown`；目录中的用例或夹具随后被删除或修改均不影响这些冻结内容。重试运行从直接源运行复制所选实例的冻结上下文，不重新查询目录，链式重试同样处理。诊断读取为只读操作，不修改运行、覆盖率、目录、快照或重试链。
+
+- 响应顶层含 `run_id`、`summary` 与 `failures`；重试运行另带 `retry_of`、`root_run_id`、`attempt`，普通运行不出现这些字段。
+- `summary` 的 `total`、`failed`、`error` 只统计最终 `outcome` 为 `failed` 或 `error` 的实例；`passed` 与 `skipped` 不进入导出。没有失败或错误时仍返回 200，三个计数为零且 `failures` 为空数组。
+- `failures` 按冻结实例顺序排列，每项含 `instance_id`、`case_id`、`case_name`、`kind`、`parameters`、`outcome`、`duration_ms`、`timeout_seconds`、`setup`、`steps`、`teardown`；仅当原结果携带 `details` 时才原样返回该字段。`setup` 与 `teardown` 保持执行计划的夹具分组结构与顺序（`{"fixture_id", "steps"}`），所有嵌套值均与内部状态隔离。
+- 同一运行未变化时重复读取的内容与数组顺序一致。
+- 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`；未知路由仍返回 404 `not_found`。创建运行期间若冻结上下文失败，不留下部分运行。
+
 ## 验证
 
 ```bash

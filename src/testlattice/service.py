@@ -867,6 +867,10 @@ class Service:
             # Freeze case names, instance ids and parameters at creation time;
             # later catalog changes must not affect the recorded run.
             instances: list[dict] = []
+            # Instance id -> frozen diagnostics context (kind, timeout, steps
+            # and the execution-plan fixture expansion). Kept out of the run
+            # report; only the diagnostics export reads it.
+            contexts: dict[str, dict] = {}
             for case_id in case_ids:
                 case = self._cases.get(case_id)
                 if case is None:
@@ -877,23 +881,53 @@ class Service:
                     raise ApiError(
                         409, "case_disabled", f"case {case_id!r} is disabled"
                     )
+                ordered = self._resolve_fixture_order(case.get("fixture_ids", ()))
+                setup = [
+                    {
+                        "fixture_id": fixture["id"],
+                        "steps": copy.deepcopy(fixture["setup_steps"]),
+                    }
+                    for fixture in ordered
+                ]
+                teardown = [
+                    {
+                        "fixture_id": fixture["id"],
+                        "steps": copy.deepcopy(fixture["teardown_steps"]),
+                    }
+                    for fixture in reversed(ordered)
+                ]
                 parameters = _expand_parameterization(case.get("parameterization"))
                 for index, values in enumerate(parameters):
+                    instance_id = f"{case_id}[{index}]"
                     instances.append(
                         {
-                            "instance_id": f"{case_id}[{index}]",
+                            "instance_id": instance_id,
                             "case_id": case_id,
                             "case_name": case["name"],
                             "parameters": copy.deepcopy(values),
                             "outcome": "pending",
                         }
                     )
+                    contexts[instance_id] = {
+                        "kind": case["kind"],
+                        "timeout_seconds": case["timeout_seconds"],
+                        "setup": copy.deepcopy(setup),
+                        "steps": copy.deepcopy(case["steps"]),
+                        "teardown": copy.deepcopy(teardown),
+                    }
             if len(instances) > MAX_RUN_INSTANCES:
                 raise _validation(
                     f"run expands to {len(instances)} instances; "
                     f"limit is {MAX_RUN_INSTANCES}"
                 )
-            run = {"id": run_id, "status": "open", "instances": instances}
+            # The run is stored only after every instance context was frozen,
+            # so a failure above cannot leave a partial run behind.
+            run = {
+                "id": run_id,
+                "status": "open",
+                "instances": instances,
+                "contexts": contexts,
+            }
             self._runs[run_id] = run
             return self._run_report(run)
 
@@ -974,6 +1008,67 @@ class Service:
                 },
                 "files": files,
             }
+
+    def get_run_diagnostics(self, run_id: str) -> dict:
+        """Read-only failure diagnostics export for a completed run.
+
+        Only instances whose final outcome is ``failed`` or ``error`` are
+        exported, in frozen instance order, each carrying the context frozen
+        at run creation (or copied by the retry chain). Nothing is mutated,
+        so repeated reads of the same run return identical content.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+
+            failures: list[dict] = []
+            failed = 0
+            error = 0
+            for instance in run["instances"]:
+                outcome = instance["outcome"]
+                if outcome not in RETRY_OUTCOMES:
+                    continue
+                if outcome == "failed":
+                    failed += 1
+                else:
+                    error += 1
+                context = run["contexts"][instance["instance_id"]]
+                entry = {
+                    "instance_id": instance["instance_id"],
+                    "case_id": instance["case_id"],
+                    "case_name": instance["case_name"],
+                    "kind": context["kind"],
+                    "parameters": copy.deepcopy(instance["parameters"]),
+                    "outcome": outcome,
+                    "duration_ms": instance["duration_ms"],
+                    "timeout_seconds": context["timeout_seconds"],
+                    "setup": copy.deepcopy(context["setup"]),
+                    "steps": copy.deepcopy(context["steps"]),
+                    "teardown": copy.deepcopy(context["teardown"]),
+                }
+                if "details" in instance:
+                    entry["details"] = copy.deepcopy(instance["details"])
+                failures.append(entry)
+
+            report = {
+                "run_id": run_id,
+                "summary": {
+                    "total": failed + error,
+                    "failed": failed,
+                    "error": error,
+                },
+                "failures": failures,
+            }
+            if "retry_of" in run:
+                report["retry_of"] = run["retry_of"]
+                report["root_run_id"] = run["root_run_id"]
+                report["attempt"] = run["attempt"]
+            return report
 
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -1114,6 +1209,15 @@ class Service:
                 }
                 for item in selected
             ]
+            # The frozen diagnostics context travels with each selected
+            # instance; the catalog is never consulted, so chained retries
+            # copy it from their direct source run in the same way.
+            contexts = {
+                item["instance_id"]: copy.deepcopy(
+                    source["contexts"][item["instance_id"]]
+                )
+                for item in selected
+            }
             source_attempt = source.get("attempt")
             attempt = source_attempt + 1 if source_attempt is not None else 1
             root_run_id = (
@@ -1125,6 +1229,7 @@ class Service:
                 "id": run_id,
                 "status": "open",
                 "instances": instances,
+                "contexts": contexts,
                 "retry_of": source_run_id,
                 "root_run_id": root_run_id,
                 "attempt": attempt,

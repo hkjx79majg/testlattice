@@ -138,6 +138,10 @@ class Handler(BaseHTTPRequestHandler):
         if run_id is not None:
             self.handle_get_run_coverage(run_id)
             return
+        run_id = _subresource(path, "/v1/runs/", "/diagnostics")
+        if run_id is not None:
+            self.handle_get_run_diagnostics(run_id)
+            return
         run_id = _resource_id(path, "/v1/runs/")
         if run_id is not None:
             self.handle_get_run(run_id)
@@ -206,6 +210,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_get_run_coverage(self, run_id: str) -> None:
         try:
             report = self.service.get_run_coverage(run_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, report)
+
+    def handle_get_run_diagnostics(self, run_id: str) -> None:
+        try:
+            report = self.service.get_run_diagnostics(run_id)
         except ApiError as error:
             self.send_api_error(error)
             return
