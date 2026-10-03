@@ -96,6 +96,19 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 源运行不存在返回 404 `run_not_found`；源运行尚未完成返回 409 `run_incomplete`；筛选后没有可重试实例返回 409 `retry_not_needed`；新 `id` 已存在返回 409 `run_exists`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体不是对象、缺少 `id`、含未知字段，或 `outcomes` 的类型、成员、空值与重复性不符合约束时返回 400 `validation_error`。任何失败都不占用新 `id`，也不留下部分运行。
 
+## 跨运行聚合
+
+`POST /v1/reports/aggregate` 对多个已完成运行做只读聚合。请求体只能含 `run_ids`：按分析顺序排列的 1 至 100 个不重复的非空运行 id；普通运行与重试运行均可参与，且必须已完成。聚合只读取冻结的实例与结果，不查询用例目录，也不修改任何数据。
+
+- 成功返回 200：`{"run_count", "passed", "summary", "runs", "cases"}`。
+- `runs` 保持请求顺序，每项含 `run_id`、`passed`、`summary`；重试运行另带 `retry_of`、`root_run_id`、`attempt`。`summary` 统计 `total`、`passed`、`failed`、`error`、`skipped`、`duration_ms`。
+- 顶层 `summary` 为各运行对应字段之和；`passed` 仅在 `failed` 与 `error` 均为零时为 `true`。
+- `cases` 按依次扫描各运行及其实例时 `case_id` 首次出现的顺序排列，每项含 `case_id`、`summary`、`trend`、`runs`；用例 `summary` 按其全部实例统计同一组字段。
+- 用例内 `runs` 只列实际包含该用例的运行并保持外层顺序，每项含 `run_id`、冻结的 `case_name`、`summary`、`passed`；参数化实例与重复参数行逐项计数，`skipped` 不算失败。
+- `trend`：只出现一次为 `insufficient`；多次均通过或均未通过分别为 `stable_pass`、`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
+- 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取：第一个不存在的运行返回 404 `run_not_found`，第一个未完成的运行返回 409 `run_incomplete`。
+- 重启仍清空内存数据；其他既有入口行为不变，未知路由仍返回 404 `not_found`。
+
 ### JUnit XML 导出
 
 `GET /v1/runs/{run_id}/junit.xml` 将**已完成**运行确定性导出为 JUnit XML（200，`Content-Type: application/xml; charset=utf-8`，UTF-8 正文，含 `<?xml version="1.0" encoding="UTF-8"?>` 声明，根元素为 `testsuite`）。同一运行未改变时多次导出的正文逐字节一致；导出为只读操作，不改变运行、目录或重试数据。

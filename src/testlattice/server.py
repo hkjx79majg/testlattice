@@ -275,6 +275,9 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_id is not None:
             self.handle_compare_snapshot(snapshot_id)
             return
+        if parts.path == "/v1/reports/aggregate":
+            self.handle_aggregate_reports()
+            return
         if parts.path == "/v1/runs":
             self.handle_create_run()
             return
@@ -355,6 +358,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_api_error(error)
             return
         self.send_json(201, run)
+
+    def handle_aggregate_reports(self) -> None:
+        try:
+            payload = self.read_body()
+            report = self.service.aggregate_runs(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, report)
 
     def handle_submit_result(self, run_id: str) -> None:
         try:
