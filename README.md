@@ -75,7 +75,7 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 ## 运行记录
 
-进程内保存运行（run）记录，重启后清空。`POST /v1/runs` 接收 `id`（去除首尾空白后须非空、唯一）与 `case_ids`（按声明顺序 1 至 100 个不重复的现有启用用例），创建时依次冻结每个用例的名称及其实例标识与参数，目录后续变化不影响记录；单次运行的总实例数上限为 5000。创建成功返回 201 及状态为 `open` 的完整报告，`GET /v1/runs/{run_id}` 返回同一报告。
+进程内保存运行（run）记录，重启后清空。`POST /v1/runs` 接收 `id`（去除首尾空白后须非空、唯一）与 `case_ids`（按声明顺序 1 至 100 个不重复的现有启用用例），创建时依次冻结每个用例的名称、`kind`、`timeout_seconds`、用例 `steps`、按执行计划语义展开的 `setup`/`teardown` 以及实例标识与参数，目录后续变化（含删除用例或夹具）不影响记录；单次运行的总实例数上限为 5000。创建成功返回 201 及状态为 `open` 的完整报告，`GET /v1/runs/{run_id}` 返回同一报告（报告字段不含冻结上下文，上下文仅用于诊断导出）。冻结失败时不留下部分运行。
 
 外部运行器通过 `POST /v1/runs/{run_id}/results` 逐项提交结果：`instance_id`、`outcome`（`passed`/`failed`/`error`/`skipped`）、`duration_ms`（非负整数）与可选 `details`（任意 JSON 值）；实例须属于该运行且只能提交一次。另可携带可选 `coverage` 行覆盖片段，校验规则与合并语义见下文「行覆盖率片段与合并」。报告中的 `instances` 按冻结顺序输出，未提交项 `outcome` 为 `pending`，已提交项携带原结果；运行报告本身不包含任何覆盖数据。`summary` 含 `total`、`pending`、`passed`、`failed`、`error`、`skipped` 与 `duration_ms`，时长仅累计已提交项。`POST /v1/runs/{run_id}/complete` 仅在没有 pending 实例时将状态改为 `completed` 并返回 200 报告；`passed` 仅在已完成且 `failed` 与 `error` 均为零时为 `true`，`open` 时为 `false`。
 
@@ -88,7 +88,7 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 `POST /v1/runs/{run_id}/retry` 为**已完成**运行创建重试运行（201，返回 `open` 报告），不重新读取目录、不重新展开参数化。请求体含 `id`（与普通运行相同的去首尾空白、非空、唯一规则）与可选 `outcomes`；`outcomes` 缺省为 `["failed","error"]`，显式提供时必须是非空、无重复的数组，成员只能是 `failed` 或 `error`。
 
-- 实例直接从源运行报告中按冻结顺序选取：仅保留最终 `outcome` 属于 `outcomes` 的实例，相对顺序不变；保留其 `instance_id`、`case_name` 与 `parameters`，`outcome` 重置为 `pending`，且不复制源结果的 `duration_ms` 与 `details`。因此源用例事后被删除、禁用或修改均不影响重试。
+- 实例直接从源运行报告中按冻结顺序选取：仅保留最终 `outcome` 属于 `outcomes` 的实例，相对顺序不变；保留其 `instance_id`、`case_name` 与 `parameters`，`outcome` 重置为 `pending`，且不复制源结果的 `duration_ms` 与 `details`。每个所选实例同时复制直接源运行中冻结的 `kind`、`timeout_seconds`、`steps`、`setup` 与 `teardown`，不重新查询目录；因此源用例或夹具事后被删除、禁用或修改均不影响重试，链式重试同样只复制直接源的冻结上下文。
 - 初始 `summary` 的 `total` 与 `pending` 等于所选数量，其余结果计数与 `duration_ms` 均为零。
 - 重试报告额外含 `retry_of`（直接源运行 id）、`root_run_id`（整条重试链最初的普通运行 id）与 `attempt`（首次重试为 1，链式重试在直接源的 `attempt` 上加一）；普通运行报告不出现这些字段。
 - 再次重试只依据**直接源运行**的最终结果筛选；同一源运行可以用不同的新 `id` 重试多次，各分支独立提交、互不影响。
@@ -126,6 +126,17 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 重试运行还在 `testsuite` 的 `properties` 中依次写 `retry_of`、`root_run_id`、`attempt`（值同样为紧凑 JSON）；普通运行不写该 `properties` 块。
 - 所有文本节点与属性值均做 XML 转义。
 - 运行不存在返回 404 `run_not_found`；`open` 运行返回 409 `run_incomplete`；错误响应保持现有 JSON 结构与 `application/json; charset=utf-8`。未知路由仍返回 404 `not_found`。
+
+### 失败诊断导出
+
+`GET /v1/runs/{run_id}/diagnostics` 将**已完成**运行的失败与错误实例确定性导出为 JSON（200，`application/json; charset=utf-8`），提供独立于当前目录的复现上下文。导出为只读操作，不修改运行、覆盖率、目录、快照或重试链，也不改变运行报告、结果提交与完成规则、JUnit XML、覆盖率合并及跨运行聚合。
+
+- 顶层含 `run_id`、`summary` 与 `failures`；`summary` 仅含 `total`、`failed`、`error`，统计本运行最终 `outcome` 为 `failed` 或 `error` 的实例，`passed` 与 `skipped` 不进入导出。没有失败或错误时仍返回 200，三个计数均为零且 `failures` 为空数组。
+- `failures` 按冻结实例顺序排列，每项含 `instance_id`、`case_id`、`case_name`、`kind`、`parameters`、`outcome`、`duration_ms`、`timeout_seconds`、`setup`、`steps`、`teardown`；仅当原结果提交时含 `details` 才原样返回该字段。
+- `setup` 与 `teardown` 保持执行计划的夹具分组结构与顺序（每项为 `{"fixture_id", "steps"}`，`setup` 依赖在前、`teardown` 严格反序）；`steps` 为冻结的用例步骤。响应中的全部嵌套值均与内部状态隔离。
+- 重试运行还在顶层返回 `retry_of`、`root_run_id` 与 `attempt`，语义与重试报告一致；普通运行不出现这些字段。
+- 同一运行未变化时重复读取的内容与数组顺序逐字节一致。
+- 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`；错误 JSON 结构保持兼容；未知路径继续返回 404 `not_found`。
 
 ### 跨运行聚合报告
 
