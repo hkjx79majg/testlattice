@@ -31,6 +31,8 @@ DEFAULT_CLAIM_MAX_ITEMS = 1
 MAX_CLAIM_ITEMS = 100
 MIN_LEASE_SECONDS = 1
 MAX_LEASE_SECONDS = 3600
+MIN_POOL_CAPACITY = 1
+MAX_POOL_CAPACITY = 10000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -95,6 +97,30 @@ def _validate_references(value: object, field: str) -> list[str]:
         if item in cleaned:
             raise _validation(f"{field} must not contain duplicates")
         cleaned.append(item)
+    return cleaned
+
+
+def _validate_resource_requirements(value: object) -> dict[str, int]:
+    """Object mapping resource pool ids to positive integer amounts.
+
+    Pool existence and capacity are state-dependent and checked separately
+    under the service lock when the case is created.
+    """
+    if not isinstance(value, dict):
+        raise _validation("resource_requirements must be a JSON object")
+    cleaned: dict[str, int] = {}
+    for pool_id, amount in value.items():
+        if not isinstance(pool_id, str) or not pool_id:
+            raise _validation("resource_requirements keys must be non-empty strings")
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise _validation(
+                f"resource_requirements.{pool_id} must be a positive integer"
+            )
+        if amount < 1:
+            raise _validation(
+                f"resource_requirements.{pool_id} must be a positive integer"
+            )
+        cleaned[pool_id] = amount
     return cleaned
 
 
@@ -385,6 +411,7 @@ class Service:
         self._fixtures: dict[str, dict] = {}
         self._snapshots: dict[str, dict] = {}
         self._runs: dict[str, dict] = {}
+        self._resource_pools: dict[str, dict] = {}
         # Run id -> {path: {"executable_lines": set[int], "covered_lines": set[int]}}
         self._coverage: dict[str, dict[str, dict[str, set[int]]]] = {}
 
@@ -502,6 +529,7 @@ class Service:
             "timeout_seconds",
             "parameterization",
             "fixture_ids",
+            "resource_requirements",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -569,6 +597,13 @@ class Service:
             case["fixture_ids"] = _validate_references(
                 payload["fixture_ids"], "fixture_ids"
             )
+        if (
+            "resource_requirements" in payload
+            and payload["resource_requirements"] is not None
+        ):
+            case["resource_requirements"] = _validate_resource_requirements(
+                payload["resource_requirements"]
+            )
         return case
 
     def create_case(self, payload: object) -> dict:
@@ -582,6 +617,19 @@ class Service:
                 if fixture_id not in self._fixtures:
                     raise ApiError(
                         404, "fixture_not_found", f"fixture {fixture_id!r} not found"
+                    )
+            for pool_id, amount in case.get("resource_requirements", {}).items():
+                pool = self._resource_pools.get(pool_id)
+                if pool is None:
+                    raise ApiError(
+                        404,
+                        "resource_pool_not_found",
+                        f"resource pool {pool_id!r} not found",
+                    )
+                if amount > pool["capacity"]:
+                    raise _validation(
+                        f"resource_requirements.{pool_id} exceeds pool capacity "
+                        f"{pool['capacity']}"
                     )
             self._cases[case["id"]] = case
             return copy.deepcopy(case)
@@ -769,16 +817,20 @@ class Service:
                 for fixture in reversed(ordered)
             ]
             parameters = _expand_parameterization(case.get("parameterization"))
-            instances = [
-                {
+            instances = []
+            for index, values in enumerate(parameters):
+                instance = {
                     "id": f"{case_id}[{index}]",
                     "parameters": copy.deepcopy(values),
                     "setup": copy.deepcopy(setup),
                     "steps": copy.deepcopy(case["steps"]),
                     "teardown": copy.deepcopy(teardown),
                 }
-                for index, values in enumerate(parameters)
-            ]
+                if "resource_requirements" in case:
+                    instance["resource_requirements"] = copy.deepcopy(
+                        case["resource_requirements"]
+                    )
+                instances.append(instance)
             return {"case_id": case_id, "count": len(instances), "instances": instances}
 
     # -- snapshots ---------------------------------------------------------
@@ -852,6 +904,117 @@ class Service:
         result = compare_values(expected, actual, ignored)
         return {"snapshot_id": snapshot_id, **result}
 
+    # -- resource pools ----------------------------------------------------
+
+    def _pool_allocation(self, now_ms: int) -> dict[str, int]:
+        """Live allocation per pool: amounts held by valid leases in any run.
+
+        A lease holds its resources from the claim until the result is
+        submitted, the platform rules a timeout, or the lease expires; all
+        three transitions consume or invalidate the lease, so recomputing
+        from active leases reflects releases immediately.
+        """
+        totals: dict[str, int] = {}
+        for run in self._runs.values():
+            for instance in run["instances"]:
+                lease = instance.get("lease")
+                if not self._lease_active(lease, now_ms):
+                    continue
+                for pool_id, amount in lease.get("resources", {}).items():
+                    totals[pool_id] = totals.get(pool_id, 0) + amount
+        return totals
+
+    @staticmethod
+    def _pool_view(pool: dict, allocated: Mapping[str, int]) -> dict:
+        used = allocated.get(pool["id"], 0)
+        return {
+            "id": pool["id"],
+            "name": pool["name"],
+            "capacity": pool["capacity"],
+            "allocated": used,
+            "available": pool["capacity"] - used,
+        }
+
+    def create_resource_pool(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"id", "name", "capacity"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("id", "name", "capacity"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+
+        pool_id = _clean_text(payload["id"], "id")
+        name = _clean_text(payload["name"], "name")
+        capacity = payload["capacity"]
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise _validation("capacity must be an integer")
+        if not MIN_POOL_CAPACITY <= capacity <= MAX_POOL_CAPACITY:
+            raise _validation(
+                f"capacity must be between {MIN_POOL_CAPACITY} and {MAX_POOL_CAPACITY}"
+            )
+
+        with self._lock:
+            if pool_id in self._resource_pools:
+                raise ApiError(
+                    409,
+                    "resource_pool_exists",
+                    f"resource pool {pool_id!r} already exists",
+                )
+            pool = {"id": pool_id, "name": name, "capacity": capacity}
+            self._resource_pools[pool_id] = pool
+            return self._pool_view(pool, {})
+
+    def get_resource_pool(self, pool_id: str) -> dict:
+        with self._lock:
+            pool = self._resource_pools.get(pool_id)
+            if pool is None:
+                raise ApiError(
+                    404,
+                    "resource_pool_not_found",
+                    f"resource pool {pool_id!r} not found",
+                )
+            return self._pool_view(pool, self._pool_allocation(_now_ms()))
+
+    def list_resource_pools(self) -> list[dict]:
+        """Pools are returned in creation order with live allocation figures."""
+        with self._lock:
+            allocated = self._pool_allocation(_now_ms())
+            return [
+                self._pool_view(pool, allocated)
+                for pool in self._resource_pools.values()
+            ]
+
+    def delete_resource_pool(self, pool_id: str) -> None:
+        with self._lock:
+            if pool_id not in self._resource_pools:
+                raise ApiError(
+                    404,
+                    "resource_pool_not_found",
+                    f"resource pool {pool_id!r} not found",
+                )
+            for case in self._cases.values():
+                if pool_id in case.get("resource_requirements", {}):
+                    raise ApiError(
+                        409,
+                        "resource_pool_in_use",
+                        f"resource pool {pool_id!r} is still in use",
+                    )
+            # Open runs may still claim against their frozen requirements;
+            # completed runs hold no leases and never block deletion.
+            for run in self._runs.values():
+                if run["status"] == "completed":
+                    continue
+                for context in run["contexts"]:
+                    if pool_id in context.get("resource_requirements", {}):
+                        raise ApiError(
+                            409,
+                            "resource_pool_in_use",
+                            f"resource pool {pool_id!r} is still in use",
+                        )
+            del self._resource_pools[pool_id]
+
     # -- runs -------------------------------------------------------------
 
     def _freeze_case_context(self, case: dict) -> dict:
@@ -870,13 +1033,21 @@ class Service:
             {"fixture_id": fixture["id"], "steps": copy.deepcopy(fixture["teardown_steps"])}
             for fixture in reversed(ordered)
         ]
-        return {
+        context = {
             "kind": case["kind"],
             "timeout_seconds": case["timeout_seconds"],
             "setup": setup,
             "steps": copy.deepcopy(case["steps"]),
             "teardown": teardown,
         }
+        # Resource needs freeze with the rest of the context, so later
+        # catalog changes (including case or pool deletion) cannot affect
+        # what open runs claim against.
+        if "resource_requirements" in case:
+            context["resource_requirements"] = copy.deepcopy(
+                case["resource_requirements"]
+            )
+        return context
 
     def create_run(self, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -1095,7 +1266,7 @@ class Service:
 
     @staticmethod
     def _claim_view(instance: dict, context: dict, lease: dict) -> dict:
-        return {
+        view = {
             "claim_id": lease["claim_id"],
             "instance_id": copy.deepcopy(instance["instance_id"]),
             "case_id": copy.deepcopy(instance["case_id"]),
@@ -1108,6 +1279,11 @@ class Service:
             "teardown": copy.deepcopy(context["teardown"]),
             "expires_at": lease["expires_at"],
         }
+        if "resource_requirements" in context:
+            view["resource_requirements"] = copy.deepcopy(
+                context["resource_requirements"]
+            )
+        return view
 
     def claim_instances(self, run_id: str, payload: object) -> dict:
         """Lease pending instances of one run to one worker.
@@ -1158,12 +1334,26 @@ class Service:
             now_ms = _now_ms()
             self._drop_expired_leases(run, now_ms)
             expires_at = now_ms + lease_seconds * 1000
+            # Allocation is process-wide: amounts held by valid leases in
+            # every open run count against pool capacity, and this whole
+            # scan-and-lease step runs under the service lock, so concurrent
+            # claims can never push a pool's allocated total past capacity.
+            allocated = self._pool_allocation(now_ms)
 
             claims: list[dict] = []
             for instance, context in zip(run["instances"], run["contexts"]):
                 if len(claims) >= max_items:
                     break
                 if instance["outcome"] != "pending" or "lease" in instance:
+                    continue
+                requirements = context.get("resource_requirements", {})
+                if requirements and any(
+                    allocated.get(pool_id, 0) + amount
+                    > self._resource_pools[pool_id]["capacity"]
+                    for pool_id, amount in requirements.items()
+                ):
+                    # Unsatisfiable for now: skip without blocking later
+                    # instances whose needs still fit.
                     continue
                 claim_id = secrets.token_urlsafe(18)
                 lease = {
@@ -1173,6 +1363,10 @@ class Service:
                     "expires_at": expires_at,
                     "consumed": False,
                 }
+                if requirements:
+                    lease["resources"] = dict(requirements)
+                    for pool_id, amount in requirements.items():
+                        allocated[pool_id] = allocated.get(pool_id, 0) + amount
                 instance["lease"] = lease
                 claims.append(self._claim_view(instance, context, lease))
             return {"claims": claims}

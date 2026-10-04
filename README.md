@@ -175,6 +175,18 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 参数化实例与重复参数行均逐项计数，`skipped` 不算失败。`trend` 依据该用例在各运行中的通过序列：只出现一次为 `insufficient`；多次均通过或均未通过为 `stable_pass`/`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### 命名资源池
+
+进程内保存命名资源池以协调稀缺资源，重启后清空。提供 `POST /v1/resource-pools`（201）、`GET /v1/resource-pools`（按创建顺序）、`GET /v1/resource-pools/{pool_id}` 与 `DELETE /v1/resource-pools/{pool_id}`（204，无正文）。
+
+- 资源池字段：`id`（去除首尾空白后须非空、唯一）、`name`（同规则非空）与 `capacity`（1 至 10000 的整数，布尔值不合规）。响应含 `id`、`name`、`capacity`、`allocated` 与 `available`，后两项按所有开放运行中有效租约持有的资源实时计算。
+- 读取或删除不存在的资源池返回 404 `resource_pool_not_found`；重复 `id` 返回 409 `resource_pool_exists`；仍被目录用例引用或开放运行含对应冻结需求时删除返回 409 `resource_pool_in_use`，完成的历史运行不阻止删除。
+- 畸形 JSON 返回 400 `invalid_json`；请求体不是对象、字段缺失或未知、`capacity` 类型或取值不合规返回 400 `validation_error`，失败不留部分资源池。
+
+用例创建时可选 `resource_requirements`：对象把资源池 id 映射到正整数需求量（布尔值、非整数、零与负数均不合规），随用例创建、读取、列表与执行计划的每个实例返回；未声明该字段的用例视为空需求，其既有响应不增加资源字段。引用不存在的池返回 404 `resource_pool_not_found`，需求超过池容量返回 400 `validation_error`，失败不留部分用例。
+
+创建运行时把每个实例的资源需求与执行上下文一同冻结，目录后续变化（含删除用例）不影响它；重试运行沿冻结上下文继续携带需求。领取时在服务锁内对所有开放运行原子分配：仍按当前运行的冻结顺序扫描，资源不足的实例被跳过但不阻塞后续可满足实例，响应仍不超过 `max_items`；并发领取不会使任一池的 `allocated` 超过 `capacity`。带资源的 claim 额外返回 `resource_requirements`。分配持续到结果成功提交、平台判定超时或租约到期，并随该状态转换释放，后续领取与资源池读取立即反映释放。
+
 ## 验证
 
 ```bash

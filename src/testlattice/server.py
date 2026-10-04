@@ -130,6 +130,13 @@ class Handler(BaseHTTPRequestHandler):
         if snapshot_id is not None:
             self.handle_get_snapshot(snapshot_id)
             return
+        if path == "/v1/resource-pools":
+            self.handle_list_resource_pools()
+            return
+        pool_id = _resource_id(path, "/v1/resource-pools/")
+        if pool_id is not None:
+            self.handle_get_resource_pool(pool_id)
+            return
         run_id = _subresource(path, "/v1/runs/", "/junit.xml")
         if run_id is not None:
             self.handle_get_run_junit(run_id)
@@ -305,6 +312,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/v1/runs":
             self.handle_create_run()
             return
+        if parts.path == "/v1/resource-pools":
+            self.handle_create_resource_pool()
+            return
         run_id = _subresource(parts.path, "/v1/runs/", "/results")
         if run_id is not None:
             self.handle_submit_result(run_id)
@@ -400,6 +410,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(201, run)
 
+    def handle_create_resource_pool(self) -> None:
+        try:
+            payload = self.read_body()
+            pool = self.service.create_resource_pool(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, pool)
+
+    def handle_get_resource_pool(self, pool_id: str) -> None:
+        try:
+            self.send_json(200, self.service.get_resource_pool(pool_id))
+        except ApiError as error:
+            self.send_api_error(error)
+
+    def handle_list_resource_pools(self) -> None:
+        self.send_json(200, self.service.list_resource_pools())
+
+    def handle_delete_resource_pool(self, pool_id: str) -> None:
+        try:
+            self.service.delete_resource_pool(pool_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_no_content()
+
     def handle_submit_result(self, run_id: str) -> None:
         try:
             payload = self.read_body()
@@ -464,6 +500,10 @@ class Handler(BaseHTTPRequestHandler):
         snapshot_id = _resource_id(path, "/v1/snapshots/")
         if snapshot_id is not None:
             self.handle_delete_snapshot(snapshot_id)
+            return
+        pool_id = _resource_id(path, "/v1/resource-pools/")
+        if pool_id is not None:
+            self.handle_delete_resource_pool(pool_id)
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
