@@ -35,6 +35,7 @@ MIN_POOL_CAPACITY = 1
 MAX_POOL_CAPACITY = 10000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
+ARCHIVE_VERSION = 1
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -84,6 +85,53 @@ def _validate_steps(value: object, field: str) -> list:
         if not isinstance(action, str) or action == "":
             raise _validation(f"{field}[{index}].action must be a non-empty string")
     return copy.deepcopy(value)
+
+
+def _validate_fixture_plan(value: object, field: str) -> list:
+    """Archived setup/teardown arrays: {"fixture_id", "steps"} entries."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    plan: list[dict] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise _validation(f"{field}[{index}] must be a JSON object")
+        unknown = set(entry) - {"fixture_id", "steps"}
+        if unknown:
+            raise _validation(
+                f"{field}[{index}] unknown fields: {', '.join(sorted(unknown))}"
+            )
+        for name in ("fixture_id", "steps"):
+            if name not in entry:
+                raise _validation(f"{field}[{index}].{name} is required")
+        fixture_id = _reference(entry["fixture_id"], f"{field}[{index}].fixture_id")
+        steps = _validate_steps(entry["steps"], f"{field}[{index}].steps")
+        plan.append({"fixture_id": fixture_id, "steps": steps})
+    return plan
+
+
+def _validate_archive_lines(value: object, field: str, *, allow_empty: bool) -> list[int]:
+    """Archived line numbers: unique positive integers in ascending order.
+
+    Unlike request fragments, archived coverage is already normalized, so the
+    sorted order is part of the contract; accepting anything else would break
+    byte-identical re-export of a restored run.
+    """
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    if not allow_empty and not value:
+        raise _validation(f"{field} must not be empty")
+    lines: list[int] = []
+    previous: int | None = None
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if item < 1:
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if previous is not None and item <= previous:
+            raise _validation(f"{field} must be unique and in ascending order")
+        previous = item
+        lines.append(item)
+    return lines
 
 
 def _validate_references(value: object, field: str) -> list[str]:
@@ -1235,6 +1283,391 @@ class Service:
                 report["root_run_id"] = run["root_run_id"]
                 report["attempt"] = run["attempt"]
             return report
+
+    # -- run archives ------------------------------------------------------
+
+    def get_run_archive(self, run_id: str) -> dict:
+        """Self-contained, deterministic archive of a completed run.
+
+        The archive carries everything needed to restore the run after a
+        restart: the full report with result details, the frozen per-instance
+        contexts in frozen order and the normalized merged coverage. It never
+        contains catalog objects, resource pool definitions, leases or other
+        runs, and repeated exports of an unchanged run are byte-identical.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            contexts = []
+            for instance, context in zip(run["instances"], run["contexts"]):
+                contexts.append(
+                    {
+                        "case_name": copy.deepcopy(instance["case_name"]),
+                        "kind": copy.deepcopy(context["kind"]),
+                        "parameters": copy.deepcopy(instance["parameters"]),
+                        "timeout_seconds": context["timeout_seconds"],
+                        "setup": copy.deepcopy(context["setup"]),
+                        "steps": copy.deepcopy(context["steps"]),
+                        "teardown": copy.deepcopy(context["teardown"]),
+                        "resource_requirements": copy.deepcopy(
+                            context.get("resource_requirements", {})
+                        ),
+                    }
+                )
+            files: dict[str, dict[str, list[int]]] = {}
+            for path, entry in self._coverage.get(run_id, {}).items():
+                files[path] = {
+                    "executable_lines": sorted(entry["executable_lines"]),
+                    "covered_lines": sorted(entry["covered_lines"]),
+                }
+            return {
+                "archive_version": ARCHIVE_VERSION,
+                "run": self._run_report(run),
+                "contexts": contexts,
+                "coverage": {"files": files},
+            }
+
+    def import_run_archive(self, payload: object) -> dict:
+        """Restore a completed run from an archive produced by get_run_archive.
+
+        The archive is fully validated before any state is touched, so a
+        failed import neither occupies the run id nor leaves partial run or
+        coverage state behind. Retry lineage (retry_of, root_run_id, attempt)
+        is restored verbatim even when ancestor runs were never imported.
+        """
+        run, coverage = self._validate_run_archive(payload)
+        with self._lock:
+            run_id = run["id"]
+            if run_id in self._runs:
+                raise ApiError(409, "run_exists", f"run {run_id!r} already exists")
+            self._runs[run_id] = run
+            if coverage:
+                self._coverage[run_id] = coverage
+            return self._run_report(run)
+
+    @staticmethod
+    def _validate_run_archive(payload: object) -> tuple[dict, dict]:
+        """Validate an archive document and build the internal run record.
+
+        Returns the stored run dict plus the merged coverage accumulator; the
+        caller inserts both atomically once the id is known to be free.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"archive_version", "run", "contexts", "coverage"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("archive_version", "run", "contexts", "coverage"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+        version = payload["archive_version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise _validation("archive_version must be an integer")
+        if version != ARCHIVE_VERSION:
+            raise _validation(f"archive_version must be {ARCHIVE_VERSION}")
+
+        report = payload["run"]
+        if not isinstance(report, dict):
+            raise _validation("run must be a JSON object")
+        unknown = set(report) - {
+            "id",
+            "status",
+            "passed",
+            "instances",
+            "summary",
+            "retry_of",
+            "root_run_id",
+            "attempt",
+        }
+        if unknown:
+            raise _validation(f"run unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("id", "status", "passed", "instances", "summary"):
+            if field not in report:
+                raise _validation(f"run.{field} is required")
+
+        run_id = report["id"]
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise _validation("run.id must be a non-empty string")
+        if report["status"] != "completed":
+            raise _validation("run.status must be completed")
+        passed = report["passed"]
+        if not isinstance(passed, bool):
+            raise _validation("run.passed must be a boolean")
+
+        retry_fields = {"retry_of", "root_run_id", "attempt"} & set(report)
+        if retry_fields and retry_fields != {"retry_of", "root_run_id", "attempt"}:
+            raise _validation(
+                "run retry metadata must include retry_of, root_run_id and attempt"
+            )
+        retry_of = root_run_id = None
+        attempt = None
+        if retry_fields:
+            retry_of = _reference(report["retry_of"], "run.retry_of")
+            root_run_id = _reference(report["root_run_id"], "run.root_run_id")
+            attempt = report["attempt"]
+            if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+                raise _validation("run.attempt must be a positive integer")
+
+        raw_instances = report["instances"]
+        if not isinstance(raw_instances, list):
+            raise _validation("run.instances must be an array")
+        instances: list[dict] = []
+        seen_instance_ids: set[str] = set()
+        for index, item in enumerate(raw_instances):
+            field = f"run.instances[{index}]"
+            if not isinstance(item, dict):
+                raise _validation(f"{field} must be a JSON object")
+            unknown = set(item) - {
+                "instance_id",
+                "case_id",
+                "case_name",
+                "parameters",
+                "outcome",
+                "duration_ms",
+                "details",
+            }
+            if unknown:
+                raise _validation(
+                    f"{field} unknown fields: {', '.join(sorted(unknown))}"
+                )
+            for name in (
+                "instance_id",
+                "case_id",
+                "case_name",
+                "parameters",
+                "outcome",
+                "duration_ms",
+            ):
+                if name not in item:
+                    raise _validation(f"{field}.{name} is required")
+            instance_id = _reference(item["instance_id"], f"{field}.instance_id")
+            if instance_id in seen_instance_ids:
+                raise _validation("run.instances instance_id values must be unique")
+            seen_instance_ids.add(instance_id)
+            case_id = _reference(item["case_id"], f"{field}.case_id")
+            case_name = item["case_name"]
+            if not isinstance(case_name, str) or not case_name:
+                raise _validation(f"{field}.case_name must be a non-empty string")
+            parameters = item["parameters"]
+            if not isinstance(parameters, dict):
+                raise _validation(f"{field}.parameters must be a JSON object")
+            for param_name, param_value in parameters.items():
+                if not _is_scalar(param_value):
+                    raise _validation(
+                        f"{field}.parameters.{param_name} must be a scalar"
+                    )
+            outcome = item["outcome"]
+            if not isinstance(outcome, str) or outcome not in ALLOWED_OUTCOMES:
+                raise _validation(
+                    f"{field}.outcome must be one of: {', '.join(ALLOWED_OUTCOMES)}"
+                )
+            duration_ms = item["duration_ms"]
+            if (
+                isinstance(duration_ms, bool)
+                or not isinstance(duration_ms, int)
+                or duration_ms < 0
+            ):
+                raise _validation(f"{field}.duration_ms must be a non-negative integer")
+            instance = {
+                "instance_id": instance_id,
+                "case_id": case_id,
+                "case_name": case_name,
+                "parameters": copy.deepcopy(parameters),
+                "outcome": outcome,
+                "duration_ms": duration_ms,
+            }
+            if "details" in item:
+                instance["details"] = copy.deepcopy(item["details"])
+            instances.append(instance)
+
+        summary = report["summary"]
+        if not isinstance(summary, dict):
+            raise _validation("run.summary must be a JSON object")
+        summary_fields = (
+            "total",
+            "pending",
+            "passed",
+            "failed",
+            "error",
+            "skipped",
+            "duration_ms",
+        )
+        unknown = set(summary) - set(summary_fields)
+        if unknown:
+            raise _validation(
+                f"run.summary unknown fields: {', '.join(sorted(unknown))}"
+            )
+        for field in summary_fields:
+            if field not in summary:
+                raise _validation(f"run.summary.{field} is required")
+            value = summary[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise _validation(
+                    f"run.summary.{field} must be a non-negative integer"
+                )
+        expected = {
+            "total": len(instances),
+            "pending": 0,
+            "passed": 0,
+            "failed": 0,
+            "error": 0,
+            "skipped": 0,
+            "duration_ms": 0,
+        }
+        for instance in instances:
+            expected[instance["outcome"]] += 1
+            expected["duration_ms"] += instance["duration_ms"]
+        if summary != expected:
+            raise _validation("run.summary does not match run.instances")
+        if passed != (expected["failed"] == 0 and expected["error"] == 0):
+            raise _validation("run.passed does not match run.summary")
+
+        raw_contexts = payload["contexts"]
+        if not isinstance(raw_contexts, list):
+            raise _validation("contexts must be an array")
+        if len(raw_contexts) != len(instances):
+            raise _validation("contexts must correspond one-to-one with run.instances")
+        contexts: list[dict] = []
+        for index, (item, instance) in enumerate(zip(raw_contexts, instances)):
+            field = f"contexts[{index}]"
+            if not isinstance(item, dict):
+                raise _validation(f"{field} must be a JSON object")
+            unknown = set(item) - {
+                "case_name",
+                "kind",
+                "parameters",
+                "timeout_seconds",
+                "setup",
+                "steps",
+                "teardown",
+                "resource_requirements",
+            }
+            if unknown:
+                raise _validation(
+                    f"{field} unknown fields: {', '.join(sorted(unknown))}"
+                )
+            for name in (
+                "case_name",
+                "kind",
+                "parameters",
+                "timeout_seconds",
+                "setup",
+                "steps",
+                "teardown",
+                "resource_requirements",
+            ):
+                if name not in item:
+                    raise _validation(f"{field}.{name} is required")
+            if item["case_name"] != instance["case_name"]:
+                raise _validation(
+                    f"{field}.case_name does not match run.instances[{index}]"
+                )
+            kind = item["kind"]
+            if not isinstance(kind, str) or kind not in ALLOWED_KINDS:
+                raise _validation(
+                    f"{field}.kind must be one of: {', '.join(ALLOWED_KINDS)}"
+                )
+            parameters = item["parameters"]
+            if not isinstance(parameters, dict):
+                raise _validation(f"{field}.parameters must be a JSON object")
+            if parameters != instance["parameters"]:
+                raise _validation(
+                    f"{field}.parameters does not match run.instances[{index}]"
+                )
+            timeout = item["timeout_seconds"]
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, int)
+                or not MIN_TIMEOUT_SECONDS <= timeout <= MAX_TIMEOUT_SECONDS
+            ):
+                raise _validation(
+                    f"{field}.timeout_seconds must be between "
+                    f"{MIN_TIMEOUT_SECONDS} and {MAX_TIMEOUT_SECONDS}"
+                )
+            setup = _validate_fixture_plan(item["setup"], f"{field}.setup")
+            teardown = _validate_fixture_plan(item["teardown"], f"{field}.teardown")
+            steps = item["steps"]
+            if not isinstance(steps, list) or not steps:
+                raise _validation(f"{field}.steps must be a non-empty array")
+            steps = _validate_steps(steps, f"{field}.steps")
+            requirements = _validate_resource_requirements(
+                item["resource_requirements"]
+            )
+            contexts.append(
+                {
+                    "kind": kind,
+                    "timeout_seconds": timeout,
+                    "setup": setup,
+                    "steps": steps,
+                    "teardown": teardown,
+                    "resource_requirements": requirements,
+                }
+            )
+
+        raw_coverage = payload["coverage"]
+        if not isinstance(raw_coverage, dict):
+            raise _validation("coverage must be a JSON object")
+        unknown = set(raw_coverage) - {"files"}
+        if unknown:
+            raise _validation(
+                f"coverage unknown fields: {', '.join(sorted(unknown))}"
+            )
+        if "files" not in raw_coverage:
+            raise _validation("coverage.files is required")
+        raw_files = raw_coverage["files"]
+        if not isinstance(raw_files, dict):
+            raise _validation("coverage.files must be a JSON object")
+        coverage: dict[str, dict[str, set[int]]] = {}
+        for path, entry in raw_files.items():
+            if not isinstance(path, str) or path == "":
+                raise _validation("coverage file paths must be non-empty strings")
+            if not isinstance(entry, dict):
+                raise _validation(f"coverage.files.{path} must be a JSON object")
+            entry_unknown = set(entry) - {"executable_lines", "covered_lines"}
+            if entry_unknown:
+                raise _validation(
+                    f"coverage.files.{path} unknown fields: "
+                    f"{', '.join(sorted(entry_unknown))}"
+                )
+            for name in ("executable_lines", "covered_lines"):
+                if name not in entry:
+                    raise _validation(f"coverage.files.{path}.{name} is required")
+            executable = _validate_archive_lines(
+                entry["executable_lines"],
+                f"coverage.files.{path}.executable_lines",
+                allow_empty=False,
+            )
+            covered = _validate_archive_lines(
+                entry["covered_lines"],
+                f"coverage.files.{path}.covered_lines",
+                allow_empty=True,
+            )
+            if not set(covered).issubset(executable):
+                raise _validation(
+                    f"coverage.files.{path}.covered_lines must be a subset of "
+                    "executable_lines"
+                )
+            coverage[path] = {
+                "executable_lines": set(executable),
+                "covered_lines": set(covered),
+            }
+
+        run = {
+            "id": run_id,
+            "status": "completed",
+            "instances": instances,
+            "contexts": contexts,
+        }
+        if retry_fields:
+            run["retry_of"] = retry_of
+            run["root_run_id"] = root_run_id
+            run["attempt"] = attempt
+        return run, coverage
 
     # -- leases / claims --------------------------------------------------
 

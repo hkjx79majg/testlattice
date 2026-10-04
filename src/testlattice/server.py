@@ -149,6 +149,10 @@ class Handler(BaseHTTPRequestHandler):
         if run_id is not None:
             self.handle_get_run_diagnostics(run_id)
             return
+        run_id = _subresource(path, "/v1/runs/", "/archive")
+        if run_id is not None:
+            self.handle_get_run_archive(run_id)
+            return
         run_id = _resource_id(path, "/v1/runs/")
         if run_id is not None:
             self.handle_get_run(run_id)
@@ -239,6 +243,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, report)
 
+    def handle_get_run_archive(self, run_id: str) -> None:
+        try:
+            archive = self.service.get_run_archive(run_id)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, archive)
+
     def handle_list_cases(self, query: str) -> None:
         try:
             filters = self.parse_case_filters(parse_qs(query, keep_blank_values=True))
@@ -323,6 +335,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parts.path == "/v1/runs":
             self.handle_create_run()
+            return
+        if parts.path == "/v1/run-archives":
+            self.handle_import_run_archive()
             return
         run_id = _subresource(parts.path, "/v1/runs/", "/results")
         if run_id is not None:
@@ -467,6 +482,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self.read_body()
             report = self.service.retry_run(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(201, report)
+
+    def handle_import_run_archive(self) -> None:
+        try:
+            payload = self.read_body()
+            report = self.service.import_run_archive(payload)
         except ApiError as error:
             self.send_api_error(error)
             return

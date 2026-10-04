@@ -175,6 +175,20 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 参数化实例与重复参数行均逐项计数，`skipped` 不算失败。`trend` 依据该用例在各运行中的通过序列：只出现一次为 `insufficient`；多次均通过或均未通过为 `stable_pass`/`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### 运行归档与恢复
+
+`GET /v1/runs/{run_id}/archive` 将**已完成**运行确定性导出为自包含的 JSON 归档（200，`application/json; charset=utf-8`），供外部系统移交或在进程重启后恢复。导出为只读操作，不修改运行、覆盖率、目录、快照或重试链；同一运行未变化时重复导出的 UTF-8 正文逐字节一致。
+
+- 归档顶层只含三个字段与版本号：`archive_version`（固定为整数 `1`）、`run`、`contexts`、`coverage`。`run` 为与 `GET /v1/runs/{run_id}` 完全一致的完整报告（含结果明细与重试谱系字段）；`contexts` 按冻结实例顺序逐项对应报告实例，每项含 `case_name`、`kind`、`parameters`、`timeout_seconds`、`setup`、`steps`、`teardown` 与 `resource_requirements`；`coverage` 为 `{"files": {...}}` 形式的规范化合并覆盖信息（路径与行号均升序），与覆盖率入口口径一致，无覆盖片段时为 `{"files": {}}`。
+- 归档不包含目录对象、资源池定义、租约或其他运行。
+- 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`。
+
+`POST /v1/run-archives` 接收上述完整归档并以 `run.id` 建立记录，恢复为 `completed` 状态的运行；成功返回 201 及与运行读取入口相同的完整报告。恢复后的运行继续支持现有运行读取、JUnit XML、覆盖率、诊断、跨运行聚合与失败重试，结果与导出前相同；因其仍为 `completed`，领取、结果提交、超时判定与再次完成均返回 409 `run_completed`。恢复后再次导出的归档与源归档逐字节一致。
+
+- 导入时校验：版本必须为 `1`；字段集合不得缺失或含未知字段；`contexts` 与实例一一对应（数量一致且 `case_name`、`parameters` 相符）；实例 `instance_id` 唯一；所有结果均非 `pending`；`summary` 与 `passed` 可由结果重算得到；覆盖行满足现有约束（正整数、唯一、升序、`covered_lines` 为 `executable_lines` 子集）；普通运行或重试运行的元数据自洽（`retry_of`、`root_run_id`、`attempt` 三者同现或同缺）。
+- 重试归档中的 `retry_of`、`root_run_id` 与 `attempt` 作为冻结谱系原样保留，即使祖先运行从未导入也允许恢复。
+- 畸形 JSON 返回 400 `invalid_json`；请求体非对象、字段缺失或未知、版本不支持、类型错误或内容不一致返回 400 `validation_error`；目标 `id` 已存在返回 409 `run_exists`。任何导入失败都不占用 `id`，也不留下运行或覆盖率的部分状态。
+
 ### 命名资源池
 
 进程内保存命名资源池，用于协调稀缺资源，重启后清空。提供 `POST /v1/resource-pools`（201）、`GET /v1/resource-pools`（按创建顺序）、`GET /v1/resource-pools/{pool_id}` 与 `DELETE /v1/resource-pools/{pool_id}`（204，无正文）。
