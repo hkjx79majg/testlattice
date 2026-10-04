@@ -313,6 +313,10 @@ class Handler(BaseHTTPRequestHandler):
         if run_id is not None:
             self.handle_claim_instances(run_id)
             return
+        run_id = _subresource(parts.path, "/v1/runs/", "/timeouts")
+        if run_id is not None:
+            self.handle_check_timeouts(run_id)
+            return
         run_id = _subresource(parts.path, "/v1/runs/", "/complete")
         if run_id is not None:
             self.handle_complete_run(run_id)
@@ -421,6 +425,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_api_error(error)
             return
         self.send_json(200, report)
+
+    def handle_check_timeouts(self, run_id: str) -> None:
+        try:
+            payload = self.read_body()
+            result = self.service.check_timeouts(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, result)
 
     def handle_retry_run(self, run_id: str) -> None:
         try:

@@ -1169,6 +1169,7 @@ class Service:
                 lease = {
                     "claim_id": claim_id,
                     "worker_id": worker_id,
+                    "claimed_at": now_ms,
                     "expires_at": expires_at,
                     "consumed": False,
                 }
@@ -1293,6 +1294,66 @@ class Service:
                 accumulated = self._coverage.setdefault(run_id, {})
                 _merge_coverage(accumulated, coverage)
             return self._run_report(run)
+
+    def check_timeouts(self, run_id: str, payload: object) -> dict:
+        """Detect leased instances whose frozen timeout has elapsed.
+
+        Only pending instances holding a valid lease (unconsumed and not yet
+        expired by ``expires_at``) are considered, and only once the server
+        clock reaches ``claimed_at`` plus the frozen ``timeout_seconds``.
+        Each hit consumes the lease and writes an ``error`` result
+        atomically, so a concurrent result submission for the same instance
+        can no longer succeed. Instances with a result, no lease, a consumed
+        lease or an expired lease are left untouched and keep their
+        re-claim semantics. The run is never auto-completed.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        if payload:
+            raise _validation(f"unknown fields: {', '.join(sorted(payload))}")
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            now_ms = _now_ms()
+            # Expired leases vanish silently exactly as in claims/results;
+            # their instances stay pending and claimable, never timed out.
+            self._drop_expired_leases(run, now_ms)
+
+            timed_out: list[str] = []
+            for instance, context in zip(run["instances"], run["contexts"]):
+                if instance["outcome"] != "pending":
+                    continue
+                lease = instance.get("lease")
+                if lease is None:
+                    continue
+                timeout_seconds = context["timeout_seconds"]
+                timeout_ms = timeout_seconds * 1000
+                deadline_at = lease["claimed_at"] + timeout_ms
+                if now_ms < deadline_at:
+                    continue
+                # Consume the lease and write the timeout result atomically;
+                # a late submission carrying the old claim id then fails
+                # with claim_not_active and cannot overwrite the result.
+                lease["consumed"] = True
+                instance.pop("lease", None)
+                instance["outcome"] = "error"
+                instance["duration_ms"] = timeout_ms
+                instance["details"] = {
+                    "code": "timeout",
+                    "timeout_seconds": timeout_seconds,
+                    "worker_id": lease["worker_id"],
+                    "claimed_at": lease["claimed_at"],
+                    "deadline_at": deadline_at,
+                    "detected_at": now_ms,
+                }
+                timed_out.append(instance["instance_id"])
+            return {"timed_out": timed_out, "run": self._run_report(run)}
 
     def complete_run(self, run_id: str) -> dict:
         with self._lock:

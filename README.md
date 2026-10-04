@@ -102,6 +102,16 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 实例无有效租约且未提供 `claim_id` 时，保留原有的直接提交行为；实例无有效租约却提供 `claim_id` 返回 409 `claim_not_active`。
 - 运行报告、跨运行聚合、JUnit XML、覆盖率与诊断导出、完成与重试响应均不增加任何租约字段；租约中的实例仍计入 `pending`，未完成结果前不可 complete。
 
+### 占用超时判定
+
+`POST /v1/runs/{run_id}/timeouts` 由平台判定占用中的超时实例。请求体必须是空 JSON 对象；判定在服务锁内对开放运行原子完成：仅当 pending 实例持有有效租约（未消费且未按 `expires_at` 失效），且服务端当前时间达到 `claimed_at`（领取时的纪元毫秒）加冻结 `timeout_seconds` 时才判定超时。已有结果、无租约、已消费或已按 `expires_at` 失效的租约均不处理——失效租约仍只让实例保持 `pending` 并可再次领取。
+
+- 响应 200 为 `{"timed_out": [...], "run": {...}}`：`timed_out` 按冻结顺序列出本次新超时的 `instance_id`，无命中时为空数组；`run` 为完整运行报告。
+- 命中实例在同一原子步骤内消费租约并写入结果：`outcome` 为 `error`，`duration_ms` 为冻结 `timeout_seconds` 乘 1000，`details` 固定含 `code`（`timeout`）、`timeout_seconds`、`worker_id`、`claimed_at`、`deadline_at`（等于 `claimed_at` 加超时毫秒）与 `detected_at`（本次检查时间），三个时间均为纪元毫秒整数。超时结果不含覆盖率，也不自动完成运行。
+- 同一实例的结果提交与超时判定并发时只有一个成功；超时先成功后，携带原 `claim_id` 的迟到提交返回 409 `claim_not_active`，且不覆盖结果。
+- 超时结果纳入现有 `summary`、JUnit XML、诊断导出、跨运行聚合与默认失败重试（`error` outcome）；冻结上下文与重试链语义不变。
+- 运行不存在返回 404 `run_not_found`；运行已完成返回 409 `run_completed`；畸形 JSON 返回 400 `invalid_json`；请求体不是对象或含字段返回 400 `validation_error`。所有失败都不改变实例、租约或覆盖率。
+
 ### 失败实例重试
 
 `POST /v1/runs/{run_id}/retry` 为**已完成**运行创建重试运行（201，返回 `open` 报告），不重新读取目录、不重新展开参数化。请求体含 `id`（与普通运行相同的去首尾空白、非空、唯一规则）与可选 `outcomes`；`outcomes` 缺省为 `["failed","error"]`，显式提供时必须是非空、无重复的数组，成员只能是 `failed` 或 `error`。
