@@ -35,6 +35,7 @@ MIN_POOL_CAPACITY = 1
 MAX_POOL_CAPACITY = 10000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
 RETRY_OUTCOMES = ("failed", "error")
+ARCHIVE_VERSION = 1
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -394,6 +395,243 @@ def _trend(flags: list[bool]) -> str:
     if not flags[0] and flags[-1]:
         return "improvement"
     return "fluctuating"
+
+
+# -- run archives -------------------------------------------------------
+
+def _archive_context_view(instance: dict, context: dict) -> dict:
+    """Archive shape of one frozen instance context.
+
+    Mirrors the claim/diagnostics view: frozen case name, kind, parameters,
+    timeout, fixture orchestration, case steps and resource requirements
+    (the latter omitted when empty).
+    """
+    view = {
+        "case_name": copy.deepcopy(instance["case_name"]),
+        "kind": copy.deepcopy(context["kind"]),
+        "parameters": copy.deepcopy(instance["parameters"]),
+        "timeout_seconds": context["timeout_seconds"],
+        "setup": copy.deepcopy(context["setup"]),
+        "steps": copy.deepcopy(context["steps"]),
+        "teardown": copy.deepcopy(context["teardown"]),
+    }
+    requirements = context.get("resource_requirements") or {}
+    if requirements:
+        view["resource_requirements"] = copy.deepcopy(requirements)
+    return view
+
+
+def _archive_coverage_files(
+    accumulated: dict[str, dict[str, set[int]]],
+) -> list[dict]:
+    """Normalized merged coverage for an archive: files ordered by Unicode
+    code point of path, line number arrays strictly ascending, covered lines
+    a subset of executable lines."""
+    files: list[dict] = []
+    for path in sorted(accumulated):
+        entry = accumulated[path]
+        files.append(
+            {
+                "path": path,
+                "executable_lines": sorted(entry["executable_lines"]),
+                "covered_lines": sorted(entry["covered_lines"]),
+            }
+        )
+    return files
+
+
+def _archive_fixture_groups(value: object, field: str) -> list[dict]:
+    """Validate a setup/teardown group array: {"fixture_id", "steps"} items."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    groups: list[dict] = []
+    for index, group in enumerate(value):
+        group_field = f"{field}[{index}]"
+        if not isinstance(group, dict):
+            raise _validation(f"{group_field} must be a JSON object")
+        unknown = set(group) - {"fixture_id", "steps"}
+        if unknown:
+            raise _validation(
+                f"{group_field} unknown fields: {', '.join(sorted(unknown))}"
+            )
+        if "fixture_id" not in group:
+            raise _validation(f"{group_field}.fixture_id is required")
+        fixture_id = group["fixture_id"]
+        if not isinstance(fixture_id, str) or fixture_id == "":
+            raise _validation(f"{group_field}.fixture_id must be a non-empty string")
+        if "steps" not in group:
+            raise _validation(f"{group_field}.steps is required")
+        steps = _validate_steps(group["steps"], f"{group_field}.steps")
+        groups.append({"fixture_id": fixture_id, "steps": steps})
+    return groups
+
+
+def _archive_context_in(value: object, index: int, instance: dict) -> dict:
+    """Validate one archived frozen context into the internal context shape.
+
+    The internal context does not carry the frozen case name or parameters
+    (those live on the instance), but the archive repeats them, so they are
+    checked for one-to-one consistency with the paired run instance.
+    """
+    field = f"contexts[{index}]"
+    if not isinstance(value, dict):
+        raise _validation(f"{field} must be a JSON object")
+    allowed = {
+        "case_name",
+        "kind",
+        "parameters",
+        "timeout_seconds",
+        "setup",
+        "steps",
+        "teardown",
+        "resource_requirements",
+    }
+    unknown = set(value) - allowed
+    if unknown:
+        raise _validation(
+            f"{field} unknown fields: {', '.join(sorted(unknown))}"
+        )
+    for name in (
+        "case_name",
+        "kind",
+        "parameters",
+        "timeout_seconds",
+        "setup",
+        "steps",
+        "teardown",
+    ):
+        if name not in value:
+            raise _validation(f"{field}.{name} is required")
+
+    case_name = value["case_name"]
+    if not isinstance(case_name, str) or not case_name.strip():
+        raise _validation(f"{field}.case_name must be a non-empty string")
+    if case_name != instance["case_name"]:
+        raise _validation(
+            f"{field}.case_name must match the paired run instance"
+        )
+    parameters = value["parameters"]
+    if not isinstance(parameters, dict):
+        raise _validation(f"{field}.parameters must be a JSON object")
+    if parameters != instance["parameters"]:
+        raise _validation(
+            f"{field}.parameters must match the paired run instance"
+        )
+
+    kind = value["kind"]
+    if not isinstance(kind, str) or kind not in ALLOWED_KINDS:
+        raise _validation(f"{field}.kind must be one of: {', '.join(ALLOWED_KINDS)}")
+    timeout = value["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise _validation(f"{field}.timeout_seconds must be an integer")
+    if not MIN_TIMEOUT_SECONDS <= timeout <= MAX_TIMEOUT_SECONDS:
+        raise _validation(
+            f"{field}.timeout_seconds must be between "
+            f"{MIN_TIMEOUT_SECONDS} and {MAX_TIMEOUT_SECONDS}"
+        )
+    setup = _archive_fixture_groups(value["setup"], f"{field}.setup")
+    teardown = _archive_fixture_groups(value["teardown"], f"{field}.teardown")
+    steps = _validate_steps(value["steps"], f"{field}.steps")
+    if not steps:
+        raise _validation(f"{field}.steps must not be empty")
+    context = {
+        "kind": kind,
+        "timeout_seconds": timeout,
+        "setup": setup,
+        "steps": steps,
+        "teardown": teardown,
+        "resource_requirements": {},
+    }
+    if "resource_requirements" in value:
+        context["resource_requirements"] = _validate_resource_requirements(
+            value["resource_requirements"]
+        )
+    return context
+
+
+def _archive_sorted_lines(value: object, field: str, *, allow_empty: bool) -> list[int]:
+    """Unique positive integers already normalized into ascending order."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    if not allow_empty and not value:
+        raise _validation(f"{field} must not be empty")
+    lines: list[int] = []
+    previous: int | None = None
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise _validation(f"{field}[{index}] must be a positive integer")
+        if previous is not None and item <= previous:
+            raise _validation(
+                f"{field} must contain unique integers in ascending order"
+            )
+        previous = item
+        lines.append(item)
+    return lines
+
+
+def _archive_coverage_in(value: object) -> dict[str, dict[str, set[int]]]:
+    """Validate archived normalized coverage into the internal accumulator
+    shape ({path: {"executable_lines": set, "covered_lines": set}}).
+
+    The merged archive (unlike per-result fragments) may hold any number of
+    files or lines, but every file still obeys the existing line constraints:
+    non-empty unique ascending positive executable lines, with covered lines
+    a unique ascending subset.
+    """
+    if not isinstance(value, dict):
+        raise _validation("coverage must be a JSON object")
+    unknown = set(value) - {"files"}
+    if unknown:
+        raise _validation(
+            f"coverage unknown fields: {', '.join(sorted(unknown))}"
+        )
+    if "files" not in value:
+        raise _validation("coverage.files is required")
+    files_value = value["files"]
+    if not isinstance(files_value, list):
+        raise _validation("coverage.files must be an array")
+
+    accumulated: dict[str, dict[str, set[int]]] = {}
+    previous_path: str | None = None
+    for index, entry in enumerate(files_value):
+        field = f"coverage.files[{index}]"
+        if not isinstance(entry, dict):
+            raise _validation(f"{field} must be a JSON object")
+        entry_unknown = set(entry) - {"path", "executable_lines", "covered_lines"}
+        if entry_unknown:
+            raise _validation(
+                f"{field} unknown fields: {', '.join(sorted(entry_unknown))}"
+            )
+        for name in ("path", "executable_lines", "covered_lines"):
+            if name not in entry:
+                raise _validation(f"{field}.{name} is required")
+        path = entry["path"]
+        if not isinstance(path, str) or path == "":
+            raise _validation(f"{field}.path must be a non-empty string")
+        if previous_path is not None and not path > previous_path:
+            raise _validation(
+                "coverage.files must be ordered by path without duplicates"
+            )
+        previous_path = path
+        executable = _archive_sorted_lines(
+            entry["executable_lines"],
+            f"{field}.executable_lines",
+            allow_empty=False,
+        )
+        covered = _archive_sorted_lines(
+            entry["covered_lines"],
+            f"{field}.covered_lines",
+            allow_empty=True,
+        )
+        if not set(covered).issubset(executable):
+            raise _validation(
+                f"{field}.covered_lines must be a subset of executable_lines"
+            )
+        accumulated[path] = {
+            "executable_lines": set(executable),
+            "covered_lines": set(covered),
+        }
+    return accumulated
 
 
 class Service:
@@ -1235,6 +1473,277 @@ class Service:
                 report["root_run_id"] = run["root_run_id"]
                 report["attempt"] = run["attempt"]
             return report
+
+    # -- run archives -----------------------------------------------------
+
+    def export_run_archive(self, run_id: str) -> dict:
+        """Build the self-contained archive of a completed run.
+
+        Contains only the frozen run record (full report shape), per-instance
+        contexts and normalized merged coverage — never catalog objects,
+        resource pool definitions, leases or other runs. Read-only and
+        deterministic: repeated exports of an unchanged run produce
+        byte-identical UTF-8 bodies once the HTTP layer sorts object keys.
+        """
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] != "completed":
+                raise ApiError(
+                    409, "run_incomplete", f"run {run_id!r} is not completed"
+                )
+            contexts = [
+                _archive_context_view(instance, context)
+                for instance, context in zip(run["instances"], run["contexts"])
+            ]
+            coverage = {
+                "files": _archive_coverage_files(self._coverage.get(run_id, {}))
+            }
+            return {
+                "archive_version": ARCHIVE_VERSION,
+                "run": self._run_report(run),
+                "contexts": contexts,
+                "coverage": coverage,
+            }
+
+    def import_run_archive(self, payload: object) -> dict:
+        """Restore a completed run from a full self-contained archive.
+
+        Everything is validated against the same shapes the running service
+        itself produces (version, field sets, instance/context one-to-one
+        correspondence, unique instance ids, recomputable summary, normalized
+        coverage, normal-vs-retry lineage consistency) before any state is
+        touched, so a failed import never occupies the id or leaves a partial
+        run or coverage record.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"archive_version", "run", "contexts", "coverage"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("archive_version", "run", "contexts", "coverage"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+
+        version = payload["archive_version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise _validation("archive_version must be an integer")
+        if version != ARCHIVE_VERSION:
+            raise _validation(
+                f"unsupported archive_version: expected {ARCHIVE_VERSION}"
+            )
+
+        run_id, instances, lineage = self._archive_run_in(payload["run"])
+        contexts_value = payload["contexts"]
+        if not isinstance(contexts_value, list):
+            raise _validation("contexts must be an array")
+        if len(contexts_value) != len(instances):
+            raise _validation(
+                "contexts must contain exactly one entry per run instance"
+            )
+        contexts = [
+            _archive_context_in(value, index, instances[index])
+            for index, value in enumerate(contexts_value)
+        ]
+        coverage_map = _archive_coverage_in(payload["coverage"])
+
+        # Construct the internal record only after full validation; deepcopy
+        # isolates stored state from both request and response objects.
+        run = {
+            "id": run_id,
+            "status": "completed",
+            "instances": copy.deepcopy(instances),
+            "contexts": copy.deepcopy(contexts),
+            **lineage,
+        }
+        coverage: dict[str, dict[str, set[int]]] = {}
+        for path, entry in coverage_map.items():
+            coverage[path] = {
+                "executable_lines": set(entry["executable_lines"]),
+                "covered_lines": set(entry["covered_lines"]),
+            }
+
+        with self._lock:
+            if run_id in self._runs:
+                raise ApiError(
+                    409, "run_exists", f"run {run_id!r} already exists"
+                )
+            self._runs[run_id] = run
+            if coverage:
+                self._coverage[run_id] = coverage
+            return self._run_report(run)
+
+    def _archive_run_in(self, value: object) -> tuple[str, list[dict], dict]:
+        """Validate the archived run block into (run id, internal instances,
+        lineage fields), recomputing the summary from the results."""
+        if not isinstance(value, dict):
+            raise _validation("run must be a JSON object")
+        allowed = {
+            "id",
+            "status",
+            "passed",
+            "instances",
+            "summary",
+            "retry_of",
+            "root_run_id",
+            "attempt",
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise _validation(
+                f"run unknown fields: {', '.join(sorted(unknown))}"
+            )
+        for field in ("id", "status", "passed", "instances", "summary"):
+            if field not in value:
+                raise _validation(f"run.{field} is required")
+
+        run_id = value["id"]
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise _validation("run.id must be a non-empty string")
+        if value["status"] != "completed":
+            raise _validation("run.status must be \"completed\"")
+
+        lineage = self._archive_lineage_in(value)
+
+        instances_value = value["instances"]
+        if not isinstance(instances_value, list) or not instances_value:
+            raise _validation("run.instances must be a non-empty array")
+        instances: list[dict] = []
+        seen_ids: set[str] = set()
+        summary = {
+            "total": len(instances_value),
+            "pending": 0,
+            "passed": 0,
+            "failed": 0,
+            "error": 0,
+            "skipped": 0,
+            "duration_ms": 0,
+        }
+        for index, item in enumerate(instances_value):
+            field = f"run.instances[{index}]"
+            if not isinstance(item, dict):
+                raise _validation(f"{field} must be a JSON object")
+            unknown = set(item) - {
+                "instance_id",
+                "case_id",
+                "case_name",
+                "parameters",
+                "outcome",
+                "duration_ms",
+                "details",
+            }
+            if unknown:
+                raise _validation(
+                    f"{field} unknown fields: {', '.join(sorted(unknown))}"
+                )
+            for name in (
+                "instance_id",
+                "case_id",
+                "case_name",
+                "parameters",
+                "outcome",
+                "duration_ms",
+            ):
+                if name not in item:
+                    raise _validation(f"{field}.{name} is required")
+            instance_id = item["instance_id"]
+            if not isinstance(instance_id, str) or instance_id == "":
+                raise _validation(f"{field}.instance_id must be a non-empty string")
+            case_id = item["case_id"]
+            if not isinstance(case_id, str) or case_id == "":
+                raise _validation(f"{field}.case_id must be a non-empty string")
+            case_name = item["case_name"]
+            if not isinstance(case_name, str) or not case_name.strip():
+                raise _validation(f"{field}.case_name must be a non-empty string")
+            parameters = item["parameters"]
+            if not isinstance(parameters, dict):
+                raise _validation(f"{field}.parameters must be a JSON object")
+            for name, param in parameters.items():
+                if not _valid_param_name(name) or not _is_scalar(param):
+                    raise _validation(
+                        f"{field}.parameters must map valid names to scalar values"
+                    )
+            outcome = item["outcome"]
+            if outcome == "pending" or outcome not in ALLOWED_OUTCOMES:
+                raise _validation(
+                    f"{field}.outcome must be one of: {', '.join(ALLOWED_OUTCOMES)}"
+                )
+            duration_ms = item["duration_ms"]
+            if isinstance(duration_ms, bool) or not isinstance(duration_ms, int):
+                raise _validation(f"{field}.duration_ms must be an integer")
+            if duration_ms < 0:
+                raise _validation(f"{field}.duration_ms must be non-negative")
+            if instance_id in seen_ids:
+                raise _validation(
+                    f"run.instances must not contain duplicate instance id "
+                    f"{instance_id!r}"
+                )
+            seen_ids.add(instance_id)
+
+            internal = {
+                "instance_id": instance_id,
+                "case_id": case_id,
+                "case_name": case_name,
+                "parameters": copy.deepcopy(parameters),
+                "outcome": outcome,
+                "duration_ms": duration_ms,
+            }
+            if "details" in item:
+                internal["details"] = copy.deepcopy(item["details"])
+            instances.append(internal)
+            summary[outcome] += 1
+            summary["duration_ms"] += duration_ms
+
+        if value["summary"] != summary:
+            raise _validation(
+                "run.summary is not consistent with the instance results"
+            )
+        expected_passed = summary["failed"] == 0 and summary["error"] == 0
+        if not isinstance(value["passed"], bool) or value["passed"] != expected_passed:
+            raise _validation(
+                "run.passed is not consistent with the instance results"
+            )
+        return run_id, instances, lineage
+
+    @staticmethod
+    def _archive_lineage_in(value: dict) -> dict:
+        """Validate normal-run versus retry-run metadata self-consistency.
+
+        Retry archives keep their frozen lineage even when the ancestor runs
+        were never imported: retry_of, root_run_id and attempt must simply be
+        present together and individually well-formed, and a normal run must
+        carry none of them.
+        """
+        lineage_fields = ("retry_of", "root_run_id", "attempt")
+        present = [name for name in lineage_fields if name in value]
+        if present and len(present) != len(lineage_fields):
+            raise _validation(
+                "run must carry retry_of, root_run_id and attempt together"
+            )
+        if not present:
+            return {}
+        retry_of = value["retry_of"]
+        root_run_id = value["root_run_id"]
+        attempt = value["attempt"]
+        for name, ref in (("retry_of", retry_of), ("root_run_id", root_run_id)):
+            if not isinstance(ref, str) or not ref.strip():
+                raise _validation(f"run.{name} must be a non-empty string")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise _validation("run.attempt must be a positive integer")
+        if retry_of == value["id"]:
+            raise _validation("run.retry_of must not be the run's own id")
+        # A first attempt retries a normal run, so its root run is the direct
+        # source; deeper attempts cannot be cross-checked without ancestors.
+        if attempt == 1 and root_run_id != retry_of:
+            raise _validation(
+                "run.root_run_id must equal run.retry_of for the first attempt"
+            )
+        return {
+            "retry_of": retry_of,
+            "root_run_id": root_run_id,
+            "attempt": attempt,
+        }
 
     # -- leases / claims --------------------------------------------------
 

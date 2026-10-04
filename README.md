@@ -166,6 +166,28 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 同一运行未变化时重复读取的内容与数组顺序逐字节一致。
 - 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`；错误 JSON 结构保持兼容；未知路径继续返回 404 `not_found`。
 
+### 可移交运行归档
+
+运行及其冻结上下文只保存在进程内，进程重启即丢失。归档入口允许外部系统把**已完成**运行导出为自包含 JSON，并在任意进程中恢复为 completed 运行；导出与导入均不读取、不修改目录、快照、资源池或其他运行。
+
+`GET /v1/runs/{run_id}/archive` 返回 200（`application/json; charset=utf-8`）的自包含归档；同一运行未变化时重复导出的 UTF-8 正文逐字节一致，导出为只读操作。顶层只含：
+
+- `archive_version`：固定为整数 `1`。
+- `run`：与 `GET /v1/runs/{run_id}` 完全相同的完整报告（含 `id`、`status`、`passed`、按冻结顺序的实例完整结果明细与可重算的 `summary`；重试运行另含 `retry_of`、`root_run_id`、`attempt`）。
+- `contexts`：按冻结实例顺序排列的上下文数组，每项含 `case_name`、`kind`、`parameters`、`timeout_seconds`、`setup`、`steps`、`teardown`；仅当冻结时存在资源需求时才含 `resource_requirements`。
+- `coverage`：`{"files": [...]}`，保存覆盖率入口所需的规范化合并结果——文件按路径 Unicode 码点排序，每个文件含 `path`、升序无重复的 `executable_lines` 与作为其子集的 `covered_lines`；无覆盖片段时 `files` 为空数组。
+
+归档不包含目录对象、夹具/快照/资源池定义、租约或任何其他运行。
+
+`POST /v1/run-archives` 只接受上述完整归档，并以 `run.id` 建立 completed 记录；成功返回 201 及与运行读取入口相同的完整报告。恢复后的运行继续支持现有读取、JUnit XML、覆盖率、诊断、跨运行聚合与失败重试，并产生与导出前相同的结果；由于状态为 completed，领取、结果提交、超时判定与再次完成一律沿用 `run_completed` 语义。恢复后再次导出与源归档逐字节一致。
+
+- 校验：归档必须是对象且只含四个顶层字段；`archive_version` 必须为 `1`（布尔值、字符串、小数均不合规）。`run` 的字段集合、类型、取值逐项校验：`status` 必须为 `completed`；实例数组非空，每个实例的 `instance_id` 在运行内唯一，所有 `outcome` 均非 `pending` 且属于现有取值；`duration_ms` 为非负整数；`summary` 必须能由实例结果逐项重算得到，`passed` 必须与失败/错误计数一致。
+- `contexts` 必须与 `run.instances` 一一对应（数量相等、按冻结顺序配对），每项的名称与参数与配对实例一致，并满足现有的 kind、超时（1–86400 整数）、步骤与夹具分组（`{"fixture_id", "steps"}`）及资源需求约束。
+- `coverage.files` 必须为数组，路径非空且不重复，行号为升序无重复正整数，可执行行非空，已覆盖行是其子集；文件与行的总量不限（合并口径而非片段口径）。
+- 谱系自洽：普通运行不得出现 `retry_of`/`root_run_id`/`attempt` 中的任一个；重试运行三者必须同时出现且 `attempt` 为正整数、`retry_of` 不得指向自身、首次重试的 `root_run_id` 必须等于 `retry_of`。重试归档按冻结谱系恢复，**即使祖先运行从未导入**也允许恢复，并可继续链式重试与参与聚合。
+- 运行不存在返回 404 `run_not_found`；导出 `open` 运行返回 409 `run_incomplete`。
+- 畸形 JSON 返回 400 `invalid_json`；请求体非对象、字段缺失或未知、版本不支持、类型错误或内容不一致返回 400 `validation_error`；目标 `id` 已存在返回 409 `run_exists`。任何导入失败都不占用 `id`，也不留下运行或覆盖率的部分状态；全部校验在写入前完成。
+
 ### 跨运行聚合报告
 
 `POST /v1/reports/aggregate` 对多个**已完成**运行做只读聚合（200），请求体只允许 `run_ids` 字段：按分析顺序的 1 至 100 个不重复非空运行 id，普通运行与重试运行均可参与。聚合只使用冻结的实例与结果，不查询用例目录，也不修改任何数据。
