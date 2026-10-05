@@ -25,6 +25,8 @@ MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
+MIN_STABILITY_RUNS = 2
+MAX_STABILITY_RUNS = 100
 MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
 DEFAULT_CLAIM_MAX_ITEMS = 1
@@ -248,6 +250,18 @@ def _coverage_percent(covered: int, executable: int) -> float:
     hundredths = covered * 10000 // executable
     remainder = covered * 10000 % executable
     if remainder * 2 >= executable:
+        hundredths += 1
+    return hundredths / 100
+
+
+def _pass_rate(passed: int, effective: int) -> float:
+    """passed / effective rounded half-up to two decimals.
+
+    Uses the same integer arithmetic as ``_coverage_percent`` so the x.xx5
+    tie rounds up (四舍五入) rather than following binary/banker's rounding.
+    """
+    hundredths = passed * 100 // effective
+    if (passed * 100 % effective) * 2 >= effective:
         hundredths += 1
     return hundredths / 100
 
@@ -2268,6 +2282,133 @@ class Service:
                 "summary": total_summary,
                 "runs": run_entries,
                 "cases": cases,
+            }
+
+    # -- stability analysis ------------------------------------------------
+
+    def stability_report(self, payload: object) -> dict:
+        """Read-only per-instance stability analysis over completed runs.
+
+        Instances are identified by (case_id, instance_id) and ordered by
+        first appearance while scanning the runs in request order; a run
+        that does not contain an instance simply contributes no observation.
+        Uses only the frozen run records; the catalog is never consulted,
+        nothing is mutated, and normal and retry runs are treated alike
+        (retry runs only add their lineage fields to each observation).
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"run_ids"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "run_ids" not in payload:
+            raise _validation("run_ids is required")
+        run_ids = _validate_references(payload["run_ids"], "run_ids")
+        if not MIN_STABILITY_RUNS <= len(run_ids) <= MAX_STABILITY_RUNS:
+            raise _validation(
+                f"run_ids must contain between {MIN_STABILITY_RUNS} and "
+                f"{MAX_STABILITY_RUNS} entries"
+            )
+
+        with self._lock:
+            runs: list[dict] = []
+            for run_id in run_ids:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+                if run["status"] != "completed":
+                    raise ApiError(
+                        409, "run_incomplete", f"run {run_id!r} is not completed"
+                    )
+                runs.append(run)
+
+            order: list[tuple[str, str]] = []
+            entries: dict[tuple[str, str], dict] = {}
+            for run in runs:
+                lineage = (
+                    {
+                        "retry_of": run["retry_of"],
+                        "root_run_id": run["root_run_id"],
+                        "attempt": run["attempt"],
+                    }
+                    if "retry_of" in run
+                    else None
+                )
+                for instance in run["instances"]:
+                    key = (instance["case_id"], instance["instance_id"])
+                    entry = entries.get(key)
+                    if entry is None:
+                        entry = entries[key] = {
+                            "case_id": instance["case_id"],
+                            "instance_id": instance["instance_id"],
+                            "case_name": instance["case_name"],
+                            "observations": [],
+                        }
+                        order.append(key)
+                    # The most recent observation's frozen case name wins.
+                    entry["case_name"] = instance["case_name"]
+                    observation = {
+                        "run_id": run["id"],
+                        "outcome": instance["outcome"],
+                        "duration_ms": instance["duration_ms"],
+                    }
+                    if lineage is not None:
+                        observation.update(lineage)
+                    entry["observations"].append(observation)
+
+            status_counts = {
+                "stable_pass": 0,
+                "stable_fail": 0,
+                "flaky": 0,
+                "insufficient": 0,
+            }
+            instances: list[dict] = []
+            for key in order:
+                entry = entries[key]
+                summary = {
+                    "total": 0,
+                    "effective": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 0,
+                    "skipped": 0,
+                    "duration_ms": 0,
+                }
+                for observation in entry["observations"]:
+                    outcome = observation["outcome"]
+                    summary["total"] += 1
+                    summary[outcome] += 1
+                    summary["duration_ms"] += observation["duration_ms"]
+                    if outcome != "skipped":
+                        summary["effective"] += 1
+                effective = summary["effective"]
+                pass_rate = (
+                    _pass_rate(summary["passed"], effective) if effective else None
+                )
+                if effective < 2:
+                    status = "insufficient"
+                elif summary["passed"] == effective:
+                    status = "stable_pass"
+                elif summary["passed"] == 0:
+                    status = "stable_fail"
+                else:
+                    status = "flaky"
+                status_counts[status] += 1
+                instances.append(
+                    {
+                        "case_id": entry["case_id"],
+                        "instance_id": entry["instance_id"],
+                        "case_name": entry["case_name"],
+                        "status": status,
+                        "pass_rate": pass_rate,
+                        "summary": summary,
+                        "observations": entry["observations"],
+                    }
+                )
+            return {
+                "run_count": len(runs),
+                "summary": {"total": len(instances), **status_counts},
+                "instances": instances,
             }
 
     @staticmethod
