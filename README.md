@@ -207,6 +207,21 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - `status` 分类：有效观测少于两次为 `insufficient`；否则有效观测全部为 `passed` 为 `stable_pass`，全部属于 `failed` 或 `error` 为 `stable_fail`，`passed` 与失败或错误并存为 `flaky`。顶层 `summary` 统计实例总数及四类状态各自的数量（`total`、`stable_pass`、`stable_fail`、`flaky`、`insufficient`）。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分结果。结构校验后按请求顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### CI 门禁判定
+
+`POST /v1/ci/gates/evaluate` 按显式策略对**已完成**运行做只读门禁判定（200），不修改运行、覆盖率、目录、归档或租约，现有报告、稳定性、覆盖率、JUnit、诊断及未知路由行为均不变。请求体只允许 `run_ids` 与 `policy` 两个字段。
+
+- `run_ids`：按时间由旧到新排列的 1 至 100 个不重复非空运行 id，末项为当前运行；普通、重试及归档恢复运行一视同仁。
+- `policy`：非空对象，只可含 `max_failed`、`max_error`、`min_coverage_percent`、`max_flaky`。三个 max 字段为非负整数（布尔值不算整数），`min_coverage_percent` 为 0 至 100 的有限数字（布尔值不算数字）；使用 `max_flaky` 时至少提供两个运行。
+
+成功响应含 `current_run_id`（`run_ids` 末项）、`run_count`、`passed` 与 `checks`。`checks` 只含请求的策略，固定按 `max_failed`、`max_error`、`min_coverage_percent`、`max_flaky` 的顺序排列；每项含 `name`、`passed`、`actual` 与 `limit`。
+
+- `max_failed`/`max_error` 取**当前运行**最终结果的 `failed`/`error` 计数，`actual` 不大于 `limit` 时通过。
+- `min_coverage_percent` 取当前运行覆盖率入口口径的合并总百分比（四舍五入到两位小数），`actual` 不小于 `limit` 时通过；当前运行没有可执行行时 `actual` 为 `null` 且检查不通过。
+- `max_flaky`：实例以 `case_id` 与 `instance_id` 联合识别，在请求运行中依次收集观测，忽略 `skipped`；某次运行不含该实例时不补观测。非 `skipped` 观测至少两次，且同时出现 `passed` 与 `failed` 或 `error` 时计为一个 flaky 实例，`actual` 不大于 `limit` 时通过。
+- 顶层 `passed` 仅在全部检查通过时为 `true`；相同输入的响应内容与顺序完全一致。
+- 畸形 JSON 返回 400 `invalid_json`；请求结构、字段、数量、重复项、空策略或数值范围不合法均返回 400 `validation_error`。结构校验后按 `run_ids` 顺序检查，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`，不返回部分结果。
+
 ### 命名资源池
 
 进程内保存命名资源池，用于协调稀缺资源，重启后清空。提供 `POST /v1/resource-pools`（201）、`GET /v1/resource-pools`（按创建顺序）、`GET /v1/resource-pools/{pool_id}` 与 `DELETE /v1/resource-pools/{pool_id}`（204，无正文）。

@@ -27,6 +27,8 @@ MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
 MIN_STABILITY_RUNS = 2
 MAX_STABILITY_RUNS = 100
+MAX_CI_GATE_RUNS = 100
+CI_POLICY_INT_FIELDS = ("max_failed", "max_error", "max_flaky")
 MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
 DEFAULT_CLAIM_MAX_ITEMS = 1
@@ -2407,6 +2409,177 @@ class Service:
                 "summary": {"total": len(instances), **status_counts},
                 "instances": instances,
             }
+
+    # -- CI gates ----------------------------------------------------------
+
+    def evaluate_ci_gate(self, payload: object) -> dict:
+        """Read-only policy evaluation over completed runs.
+
+        The current run is the last entry of ``run_ids`` (ordered oldest to
+        newest). Failed/error counts and merged coverage come from the
+        current run only; flakiness is computed across the requested runs
+        with the same instance-key and skip semantics as the stability
+        report. Nothing is mutated, and identical input produces an
+        identical response.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"run_ids", "policy"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "run_ids" not in payload:
+            raise _validation("run_ids is required")
+        if "policy" not in payload:
+            raise _validation("policy is required")
+
+        run_ids = _validate_references(payload["run_ids"], "run_ids")
+        if not 1 <= len(run_ids) <= MAX_CI_GATE_RUNS:
+            raise _validation(
+                f"run_ids must contain between 1 and {MAX_CI_GATE_RUNS} entries"
+            )
+        policy = self._validate_ci_policy(payload["policy"])
+        if "max_flaky" in policy and len(run_ids) < MIN_STABILITY_RUNS:
+            raise _validation("max_flaky requires at least two runs")
+
+        with self._lock:
+            # Structure is fully validated first; only then are the runs
+            # inspected in request order. The first missing run yields 404
+            # and the first incomplete run yields 409; no partial result is
+            # ever returned.
+            runs: list[dict] = []
+            for run_id in run_ids:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+                if run["status"] != "completed":
+                    raise ApiError(
+                        409, "run_incomplete", f"run {run_id!r} is not completed"
+                    )
+                runs.append(run)
+
+            current = runs[-1]
+            current_summary = self._run_report(current)["summary"]
+            flaky_count: int | None = None
+            checks: list[dict] = []
+
+            # Checks are always emitted in this fixed order, including only
+            # the policies the request asked for.
+            for name in (
+                "max_failed",
+                "max_error",
+                "min_coverage_percent",
+                "max_flaky",
+            ):
+                if name not in policy:
+                    continue
+                limit = policy[name]
+                if name == "max_failed":
+                    actual: int | float | None = current_summary["failed"]
+                    passed = actual <= limit
+                elif name == "max_error":
+                    actual = current_summary["error"]
+                    passed = actual <= limit
+                elif name == "max_flaky":
+                    if flaky_count is None:
+                        flaky_count = self._ci_flaky_count(runs)
+                    actual = flaky_count
+                    passed = actual <= limit
+                else:
+                    # Coverage uses the current run's merged total percentage;
+                    # with no executable lines the actual is null and fails.
+                    total_executable = 0
+                    total_covered = 0
+                    for entry in self._coverage.get(current["id"], {}).values():
+                        total_executable += len(entry["executable_lines"])
+                        total_covered += len(entry["covered_lines"])
+                    if total_executable:
+                        actual = _coverage_percent(total_covered, total_executable)
+                        passed = actual >= limit
+                    else:
+                        actual = None
+                        passed = False
+                checks.append(
+                    {
+                        "name": name,
+                        "passed": passed,
+                        "actual": actual,
+                        "limit": limit,
+                    }
+                )
+
+            return {
+                "current_run_id": current["id"],
+                "run_count": len(runs),
+                "passed": all(check["passed"] for check in checks),
+                "checks": checks,
+            }
+
+    @staticmethod
+    def _validate_ci_policy(value: object) -> dict:
+        """Validate the non-empty policy object.
+
+        The three max fields are non-negative integers (booleans are not
+        numbers); min_coverage_percent is a finite number in [0, 100].
+        Unknown fields, a non-object body or an empty object are rejected.
+        """
+        if not isinstance(value, dict):
+            raise _validation("policy must be a JSON object")
+        if not value:
+            raise _validation("policy must not be empty")
+        allowed = {*CI_POLICY_INT_FIELDS, "min_coverage_percent"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise _validation(
+                f"policy unknown fields: {', '.join(sorted(unknown))}"
+            )
+        policy: dict = {}
+        for name in CI_POLICY_INT_FIELDS:
+            if name in value:
+                item = value[name]
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise _validation(f"policy.{name} must be a non-negative integer")
+                if item < 0:
+                    raise _validation(f"policy.{name} must be a non-negative integer")
+                policy[name] = item
+        if "min_coverage_percent" in value:
+            item = value["min_coverage_percent"]
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise _validation(
+                    "policy.min_coverage_percent must be a number between 0 and 100"
+                )
+            if not math.isfinite(item) or not 0 <= item <= 100:
+                raise _validation(
+                    "policy.min_coverage_percent must be a number between 0 and 100"
+                )
+            policy["min_coverage_percent"] = item
+        return policy
+
+    @staticmethod
+    def _ci_flaky_count(runs: list[dict]) -> int:
+        """Count instances that flaked across the requested runs.
+
+        Instances are keyed by (case_id, instance_id); skipped observations
+        are ignored, a run missing the instance adds no observation, and an
+        instance is flaky once it has at least two non-skipped observations
+        showing both a passed and a failed/error outcome.
+        """
+        observations: dict[tuple[str, str], list[str]] = {}
+        for run in runs:
+            for instance in run["instances"]:
+                outcome = instance["outcome"]
+                if outcome == "skipped":
+                    continue
+                key = (instance["case_id"], instance["instance_id"])
+                observations.setdefault(key, []).append(outcome)
+        flaky = 0
+        for outcomes in observations.values():
+            if len(outcomes) < 2:
+                continue
+            if "passed" in outcomes and any(
+                outcome in ("failed", "error") for outcome in outcomes
+            ):
+                flaky += 1
+        return flaky
 
     @staticmethod
     def _run_report(run: dict) -> dict:
