@@ -27,6 +27,14 @@ MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
 MIN_STABILITY_RUNS = 2
 MAX_STABILITY_RUNS = 100
+GATE_POLICY_FIELDS = (
+    "max_failed",
+    "max_error",
+    "min_coverage_percent",
+    "max_flaky",
+)
+GATE_INTEGER_FIELDS = ("max_failed", "max_error", "max_flaky")
+MIN_GATE_FLAKY_RUNS = 2
 MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
 DEFAULT_CLAIM_MAX_ITEMS = 1
@@ -2406,6 +2414,168 @@ class Service:
                 "run_count": len(runs),
                 "summary": {"total": len(instances), **status_counts},
                 "instances": instances,
+            }
+
+    # -- CI gates ----------------------------------------------------------
+
+    def evaluate_ci_gate(self, payload: object) -> dict:
+        """Read-only policy evaluation over completed runs.
+
+        Only the explicit policy checks run; failures/errors and coverage
+        come from the current (last) run while flakiness is computed across
+        all requested runs. Uses only the frozen run records and merged
+        coverage; nothing is mutated, so identical input yields identical
+        output and order.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"run_ids", "policy"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "run_ids" not in payload:
+            raise _validation("run_ids is required")
+        if "policy" not in payload:
+            raise _validation("policy is required")
+
+        run_ids = _validate_references(payload["run_ids"], "run_ids")
+        if not 1 <= len(run_ids) <= MAX_AGGREGATE_RUNS:
+            raise _validation(
+                f"run_ids must contain between 1 and {MAX_AGGREGATE_RUNS} entries"
+            )
+
+        policy_value = payload["policy"]
+        if not isinstance(policy_value, dict) or not policy_value:
+            raise _validation("policy must be a non-empty JSON object")
+        policy_unknown = set(policy_value) - set(GATE_POLICY_FIELDS)
+        if policy_unknown:
+            raise _validation(
+                f"policy unknown fields: {', '.join(sorted(policy_unknown))}"
+            )
+        limits: dict[str, object] = {}
+        for name in GATE_INTEGER_FIELDS:
+            if name in policy_value:
+                value = policy_value[name]
+                # Booleans are numbers in Python but are explicitly not counts.
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise _validation(f"policy.{name} must be a non-negative integer")
+                if value < 0:
+                    raise _validation(f"policy.{name} must be a non-negative integer")
+                limits[name] = value
+        if "min_coverage_percent" in policy_value:
+            value = policy_value["min_coverage_percent"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise _validation(
+                    "policy.min_coverage_percent must be a finite number between 0 and 100"
+                )
+            if not math.isfinite(value) or not 0 <= value <= 100:
+                raise _validation(
+                    "policy.min_coverage_percent must be a finite number between 0 and 100"
+                )
+            limits["min_coverage_percent"] = value
+        if "max_flaky" in limits and len(run_ids) < MIN_GATE_FLAKY_RUNS:
+            raise _validation(
+                "policy.max_flaky requires at least two runs"
+            )
+
+        with self._lock:
+            # Structural validation precedes any state lookup; runs are then
+            # checked strictly in request order so the first missing run is
+            # 404 and the first incomplete run is 409, with no partial result.
+            runs: list[dict] = []
+            for run_id in run_ids:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+                if run["status"] != "completed":
+                    raise ApiError(
+                        409, "run_incomplete", f"run {run_id!r} is not completed"
+                    )
+                runs.append(run)
+
+            current = runs[-1]
+            current_report = self._run_report(current)
+            checks: list[dict] = []
+            if "max_failed" in limits:
+                actual = current_report["summary"]["failed"]
+                limit = limits["max_failed"]
+                checks.append(
+                    {
+                        "name": "max_failed",
+                        "passed": actual <= limit,
+                        "actual": actual,
+                        "limit": limit,
+                    }
+                )
+            if "max_error" in limits:
+                actual = current_report["summary"]["error"]
+                limit = limits["max_error"]
+                checks.append(
+                    {
+                        "name": "max_error",
+                        "passed": actual <= limit,
+                        "actual": actual,
+                        "limit": limit,
+                    }
+                )
+            if "min_coverage_percent" in limits:
+                limit = limits["min_coverage_percent"]
+                accumulated = self._coverage.get(current["id"], {})
+                total_executable = sum(
+                    len(entry["executable_lines"]) for entry in accumulated.values()
+                )
+                if total_executable == 0:
+                    # No executable lines: coverage is undefined and the
+                    # minimum-coverage gate cannot pass.
+                    actual: float | None = None
+                    passed = False
+                else:
+                    total_covered = sum(
+                        len(entry["covered_lines"]) for entry in accumulated.values()
+                    )
+                    actual = _coverage_percent(total_covered, total_executable)
+                    passed = actual >= limit
+                checks.append(
+                    {
+                        "name": "min_coverage_percent",
+                        "passed": passed,
+                        "actual": actual,
+                        "limit": limit,
+                    }
+                )
+            if "max_flaky" in limits:
+                limit = limits["max_flaky"]
+                # Flaky instances are keyed by (case_id, instance_id); skipped
+                # observations are ignored and runs missing an instance add no
+                # observation at all.
+                observations: dict[tuple[str, str], set[str]] = {}
+                for run in runs:
+                    for instance in run["instances"]:
+                        outcome = instance["outcome"]
+                        if outcome == "skipped":
+                            continue
+                        key = (instance["case_id"], instance["instance_id"])
+                        observations.setdefault(key, set()).add(outcome)
+                flaky = sum(
+                    1
+                    for outcomes in observations.values()
+                    if len(outcomes) >= MIN_GATE_FLAKY_RUNS
+                    and "passed" in outcomes
+                    and ({"failed", "error"} & outcomes)
+                )
+                checks.append(
+                    {
+                        "name": "max_flaky",
+                        "passed": flaky <= limit,
+                        "actual": flaky,
+                        "limit": limit,
+                    }
+                )
+
+            return {
+                "current_run_id": current["id"],
+                "run_count": len(runs),
+                "passed": all(check["passed"] for check in checks),
+                "checks": checks,
             }
 
     @staticmethod

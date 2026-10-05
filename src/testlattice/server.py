@@ -336,6 +336,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/v1/reports/stability":
             self.handle_stability_report()
             return
+        if parts.path == "/v1/ci/gates/evaluate":
+            self.handle_evaluate_ci_gate()
+            return
         if parts.path == "/v1/run-archives":
             self.handle_import_run_archive()
             return
@@ -441,6 +444,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self.read_body()
             report = self.service.stability_report(payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, report)
+
+    def handle_evaluate_ci_gate(self) -> None:
+        try:
+            payload = self.read_body()
+            report = self.service.evaluate_ci_gate(payload)
         except ApiError as error:
             self.send_api_error(error)
             return
