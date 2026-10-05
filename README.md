@@ -197,6 +197,16 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 参数化实例与重复参数行均逐项计数，`skipped` 不算失败。`trend` 依据该用例在各运行中的通过序列：只出现一次为 `insufficient`；多次均通过或均未通过为 `stable_pass`/`stable_fail`；首轮通过而末轮未通过为 `regression`，反之为 `improvement`；首末状态相同但中间改变为 `fluctuating`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分报告。结构校验后按顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
 
+### 实例稳定性分析
+
+`POST /v1/reports/stability` 对 2 至 100 个**已完成**运行做只读的实例级稳定性分析（200），请求体只允许 `run_ids` 字段：按分析顺序的不重复非空运行 id，普通运行与重试运行一视同仁。分析只使用各运行冻结的实例与最终结果，不查询用例目录，也不修改任何状态，目录对象后续变化不影响输出；相同输入的响应内容与数组顺序完全一致。
+
+- 成功响应含 `run_count`、`summary`、`instances`。实例以 `case_id` 与 `instance_id` 共同标识，按依次扫描各运行冻结实例时首次出现的顺序排列；某次运行不含该实例时不补观测。
+- 每个实例项含 `case_id`、`instance_id`、`case_name`（最近一次观测的冻结名称）、`status`、`pass_rate`、`summary`、`observations`。`observations` 保持运行扫描顺序，每项含 `run_id`、`outcome`、`duration_ms`；来自重试运行的观测另带 `retry_of`、`root_run_id`、`attempt`。
+- 实例级 `summary` 统计 `total`、`effective`、`passed`、`failed`、`error`、`skipped`、`duration_ms`，其中 `effective` 为排除 `skipped` 后的观测数。`pass_rate` 为 `passed / effective` 四舍五入到两位小数；`effective` 为零时为 `null`。
+- `status` 分类：有效观测少于两次为 `insufficient`；否则有效观测全部为 `passed` 为 `stable_pass`，全部属于 `failed` 或 `error` 为 `stable_fail`，`passed` 与失败或错误并存为 `flaky`。顶层 `summary` 统计实例总数及四类状态各自的数量（`total`、`stable_pass`、`stable_fail`、`flaky`、`insufficient`）。
+- 畸形 JSON 返回 400 `invalid_json`；请求体非对象、缺少 `run_ids`、含未知字段，或 `run_ids` 的类型、数量、成员非空性、重复性不合规时返回 400 `validation_error`，不返回部分结果。结构校验后按请求顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`。
+
 ### 命名资源池
 
 进程内保存命名资源池，用于协调稀缺资源，重启后清空。提供 `POST /v1/resource-pools`（201）、`GET /v1/resource-pools`（按创建顺序）、`GET /v1/resource-pools/{pool_id}` 与 `DELETE /v1/resource-pools/{pool_id}`（204，无正文）。

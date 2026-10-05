@@ -25,6 +25,8 @@ MAX_INSTANCES = 1000
 MAX_RUN_CASES = 100
 MAX_RUN_INSTANCES = 5000
 MAX_AGGREGATE_RUNS = 100
+MIN_STABILITY_RUNS = 2
+MAX_STABILITY_RUNS = 100
 MAX_COVERAGE_FILES = 1000
 MAX_COVERAGE_EXECUTABLE_LINES = 100000
 DEFAULT_CLAIM_MAX_ITEMS = 1
@@ -248,6 +250,19 @@ def _coverage_percent(covered: int, executable: int) -> float:
     hundredths = covered * 10000 // executable
     remainder = covered * 10000 % executable
     if remainder * 2 >= executable:
+        hundredths += 1
+    return hundredths / 100
+
+
+def _rounded_rate(numerator: int, denominator: int) -> float:
+    """numerator / denominator rounded half-up to two decimals.
+
+    Same integer half-up rule as ``_coverage_percent``, but the result is
+    a ratio in [0, 1] rather than a percentage.
+    """
+    hundredths = numerator * 100 // denominator
+    remainder = numerator * 100 % denominator
+    if remainder * 2 >= denominator:
         hundredths += 1
     return hundredths / 100
 
@@ -2268,6 +2283,129 @@ class Service:
                 "summary": total_summary,
                 "runs": run_entries,
                 "cases": cases,
+            }
+
+    # -- instance stability -------------------------------------------------
+
+    def stability_report(self, payload: object) -> dict:
+        """Read-only per-instance stability analysis over completed runs.
+
+        Uses only the frozen run records (instances and final results); the
+        catalog is never consulted and nothing is mutated, so repeated calls
+        with the same input return identical content and array order.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"run_ids"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        if "run_ids" not in payload:
+            raise _validation("run_ids is required")
+        run_ids = _validate_references(payload["run_ids"], "run_ids")
+        if not MIN_STABILITY_RUNS <= len(run_ids) <= MAX_STABILITY_RUNS:
+            raise _validation(
+                f"run_ids must contain between {MIN_STABILITY_RUNS} and "
+                f"{MAX_STABILITY_RUNS} entries"
+            )
+
+        with self._lock:
+            runs: list[dict] = []
+            for run_id in run_ids:
+                run = self._runs.get(run_id)
+                if run is None:
+                    raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+                if run["status"] != "completed":
+                    raise ApiError(
+                        409, "run_incomplete", f"run {run_id!r} is not completed"
+                    )
+                runs.append(run)
+
+            # Instances are keyed by (case_id, instance_id) and ordered by
+            # first appearance while scanning the runs in request order; a
+            # run that lacks the instance simply adds no observation.
+            order: list[tuple[str, str]] = []
+            entries: dict[tuple[str, str], dict] = {}
+            for run in runs:
+                for instance in run["instances"]:
+                    key = (instance["case_id"], instance["instance_id"])
+                    entry = entries.get(key)
+                    if entry is None:
+                        entry = entries[key] = {
+                            "case_id": instance["case_id"],
+                            "instance_id": instance["instance_id"],
+                            "case_name": instance["case_name"],
+                            "summary": {
+                                "total": 0,
+                                "effective": 0,
+                                "passed": 0,
+                                "failed": 0,
+                                "error": 0,
+                                "skipped": 0,
+                                "duration_ms": 0,
+                            },
+                            "observations": [],
+                        }
+                        order.append(key)
+                    # The frozen name of the most recent observation wins.
+                    entry["case_name"] = instance["case_name"]
+                    observation = {
+                        "run_id": run["id"],
+                        "outcome": instance["outcome"],
+                        "duration_ms": instance["duration_ms"],
+                    }
+                    if "retry_of" in run:
+                        observation["retry_of"] = run["retry_of"]
+                        observation["root_run_id"] = run["root_run_id"]
+                        observation["attempt"] = run["attempt"]
+                    entry["observations"].append(observation)
+
+                    summary = entry["summary"]
+                    outcome = instance["outcome"]
+                    summary["total"] += 1
+                    summary[outcome] += 1
+                    summary["duration_ms"] += instance["duration_ms"]
+                    if outcome != "skipped":
+                        summary["effective"] += 1
+
+            status_counts = {
+                "stable_pass": 0,
+                "stable_fail": 0,
+                "flaky": 0,
+                "insufficient": 0,
+            }
+            instances: list[dict] = []
+            for key in order:
+                entry = entries[key]
+                summary = entry["summary"]
+                effective = summary["effective"]
+                if effective < 2:
+                    status = "insufficient"
+                elif summary["passed"] == effective:
+                    status = "stable_pass"
+                elif summary["failed"] + summary["error"] == effective:
+                    status = "stable_fail"
+                else:
+                    status = "flaky"
+                status_counts[status] += 1
+                instances.append(
+                    {
+                        "case_id": entry["case_id"],
+                        "instance_id": entry["instance_id"],
+                        "case_name": entry["case_name"],
+                        "status": status,
+                        "pass_rate": (
+                            _rounded_rate(summary["passed"], effective)
+                            if effective
+                            else None
+                        ),
+                        "summary": summary,
+                        "observations": entry["observations"],
+                    }
+                )
+            return {
+                "run_count": len(runs),
+                "summary": {"total": len(instances), **status_counts},
+                "instances": instances,
             }
 
     @staticmethod
