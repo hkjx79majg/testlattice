@@ -41,6 +41,8 @@ DEFAULT_CLAIM_MAX_ITEMS = 1
 MAX_CLAIM_ITEMS = 100
 MIN_LEASE_SECONDS = 1
 MAX_LEASE_SECONDS = 3600
+MIN_HEARTBEAT_SECONDS = 1
+MAX_HEARTBEAT_SECONDS = 300
 MIN_POOL_CAPACITY = 1
 MAX_POOL_CAPACITY = 10000
 ALLOWED_OUTCOMES = ("passed", "failed", "error", "skipped")
@@ -1166,13 +1168,14 @@ class Service:
 
     def _allocated_by_pool(self, now_ms: int) -> dict[str, int]:
         """Live allocation per pool: frozen requirements of every instance
-        holding a valid lease (unconsumed, unexpired) in any open run."""
+        holding a lease that still occupies resources (unconsumed and either
+        unexpired or heartbeat-expired) in any open run."""
         allocated: dict[str, int] = {}
         for run in self._runs.values():
             if run["status"] != "open":
                 continue
             for instance, context in zip(run["instances"], run["contexts"]):
-                if not self._lease_active(instance.get("lease"), now_ms):
+                if not self._lease_holds_resources(instance.get("lease"), now_ms):
                     continue
                 for pool_id, amount in context.get("resource_requirements", {}).items():
                     allocated[pool_id] = allocated.get(pool_id, 0) + amount
@@ -1775,12 +1778,42 @@ class Service:
         """A lease is valid until (but not once) current time reaches expiry."""
         return isinstance(lease, dict) and not lease.get("consumed") and lease["expires_at"] > now_ms
 
+    @staticmethod
+    def _lease_heartbeat_expired(lease: object, now_ms: int) -> bool:
+        """A heartbeat-enabled lease whose heartbeat deadline has been reached.
+
+        Such a lease is stuck: it is no longer valid, but it is not dropped
+        either — the instance stays pending and unclaimable and the pool
+        allocation stays held until the hang detector reaps it.
+        """
+        return (
+            isinstance(lease, dict)
+            and not lease.get("consumed")
+            and lease.get("heartbeat_deadline_at") is not None
+            and lease["heartbeat_deadline_at"] <= now_ms
+        )
+
+    @staticmethod
+    def _lease_holds_resources(lease: object, now_ms: int) -> bool:
+        """Unconsumed lease still occupying its pool allocation: either still
+        valid, or heartbeat-expired (stuck until reaped via hangs)."""
+        if not isinstance(lease, dict) or lease.get("consumed"):
+            return False
+        if lease["expires_at"] > now_ms:
+            return True
+        deadline = lease.get("heartbeat_deadline_at")
+        return deadline is not None and deadline <= now_ms
+
     def _drop_expired_leases(self, run: dict, now_ms: int) -> None:
         """Expired leases vanish silently; the instances stay pending and
-        carry no result, duration or coverage, and become claimable again."""
+        carry no result, duration or coverage, and become claimable again.
+        Heartbeat-expired leases are the exception: they stay attached so
+        the instance remains pending, unclaimable and resource-holding."""
         for instance in run["instances"]:
             lease = instance.get("lease")
             if lease is not None and not self._lease_active(lease, now_ms):
+                if self._lease_heartbeat_expired(lease, now_ms):
+                    continue
                 instance.pop("lease", None)
 
     @staticmethod
@@ -1798,6 +1831,9 @@ class Service:
             "teardown": copy.deepcopy(context["teardown"]),
             "expires_at": lease["expires_at"],
         }
+        if "heartbeat_seconds" in lease:
+            view["last_heartbeat_at"] = lease["last_heartbeat_at"]
+            view["heartbeat_deadline_at"] = lease["heartbeat_deadline_at"]
         requirements = context.get("resource_requirements")
         if requirements:
             view["resource_requirements"] = copy.deepcopy(requirements)
@@ -1815,7 +1851,7 @@ class Service:
         """
         if not isinstance(payload, dict):
             raise _validation("request body must be a JSON object")
-        unknown = set(payload) - {"worker_id", "max_items", "lease_seconds"}
+        unknown = set(payload) - {"worker_id", "max_items", "lease_seconds", "heartbeat_seconds"}
         if unknown:
             raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
         if "worker_id" not in payload:
@@ -1842,6 +1878,20 @@ class Service:
             raise _validation(
                 f"lease_seconds must be between {MIN_LEASE_SECONDS} and {MAX_LEASE_SECONDS}"
             )
+
+        heartbeat_seconds: int | None = None
+        if "heartbeat_seconds" in payload:
+            value = payload["heartbeat_seconds"]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise _validation("heartbeat_seconds must be an integer")
+            if not MIN_HEARTBEAT_SECONDS <= value <= MAX_HEARTBEAT_SECONDS:
+                raise _validation(
+                    f"heartbeat_seconds must be between "
+                    f"{MIN_HEARTBEAT_SECONDS} and {MAX_HEARTBEAT_SECONDS}"
+                )
+            if value >= lease_seconds:
+                raise _validation("heartbeat_seconds must be less than lease_seconds")
+            heartbeat_seconds = value
 
         with self._lock:
             run = self._runs.get(run_id)
@@ -1878,6 +1928,14 @@ class Service:
                     "expires_at": expires_at,
                     "consumed": False,
                 }
+                if heartbeat_seconds is not None:
+                    # Liveness tracking: the first heartbeat is due one
+                    # interval after claiming, never past the lease expiry.
+                    lease["heartbeat_seconds"] = heartbeat_seconds
+                    lease["last_heartbeat_at"] = now_ms
+                    lease["heartbeat_deadline_at"] = min(
+                        now_ms + heartbeat_seconds * 1000, expires_at
+                    )
                 instance["lease"] = lease
                 for pool_id, amount in requirements.items():
                     allocated[pool_id] = allocated.get(pool_id, 0) + amount
@@ -1898,6 +1956,85 @@ class Service:
             if allocated.get(pool_id, 0) + amount > pool["capacity"]:
                 return False
         return True
+
+    def heartbeat(self, run_id: str, payload: object) -> dict:
+        """Refresh the liveness marker of one heartbeat-enabled claim.
+
+        Only the claim's own worker may heartbeat, only while the lease is
+        still valid and the previous heartbeat deadline has not been
+        reached. A successful heartbeat moves ``last_heartbeat_at`` to now
+        and pushes ``heartbeat_deadline_at`` one original interval out
+        (never past ``expires_at``); the lease expiry and the frozen hard
+        timeout are never extended. The whole check-and-update step runs
+        under the service lock.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        unknown = set(payload) - {"claim_id", "worker_id"}
+        if unknown:
+            raise _validation(f"unknown fields: {', '.join(sorted(unknown))}")
+        for field in ("claim_id", "worker_id"):
+            if field not in payload:
+                raise _validation(f"{field} is required")
+        claim_id = _reference(payload["claim_id"], "claim_id")
+        worker_id = _clean_text(payload["worker_id"], "worker_id")
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            now_ms = _now_ms()
+            # Normally expired leases vanish exactly as in claims/results;
+            # heartbeat-expired ones stay attached so they can be reported.
+            self._drop_expired_leases(run, now_ms)
+            target_instance: dict | None = None
+            target_lease: dict | None = None
+            for instance in run["instances"]:
+                lease = instance.get("lease")
+                if isinstance(lease, dict) and lease["claim_id"] == claim_id:
+                    target_instance = instance
+                    target_lease = lease
+                    break
+            if target_lease is None or target_instance is None:
+                raise ApiError(
+                    409,
+                    "claim_not_active",
+                    f"claim {claim_id!r} is not active in run {run_id!r}",
+                )
+            if target_lease["worker_id"] != worker_id:
+                raise ApiError(
+                    409,
+                    "claim_conflict",
+                    f"claim {claim_id!r} is held by another worker",
+                )
+            if "heartbeat_seconds" not in target_lease:
+                raise ApiError(
+                    409,
+                    "heartbeat_not_enabled",
+                    f"claim {claim_id!r} was leased without heartbeats",
+                )
+            if now_ms >= target_lease["heartbeat_deadline_at"]:
+                raise ApiError(
+                    409,
+                    "heartbeat_expired",
+                    f"claim {claim_id!r} has missed its heartbeat deadline",
+                )
+            target_lease["last_heartbeat_at"] = now_ms
+            target_lease["heartbeat_deadline_at"] = min(
+                now_ms + target_lease["heartbeat_seconds"] * 1000,
+                target_lease["expires_at"],
+            )
+            return {
+                "claim_id": target_lease["claim_id"],
+                "instance_id": copy.deepcopy(target_instance["instance_id"]),
+                "last_heartbeat_at": target_lease["last_heartbeat_at"],
+                "heartbeat_deadline_at": target_lease["heartbeat_deadline_at"],
+                "expires_at": target_lease["expires_at"],
+            }
 
     def submit_result(self, run_id: str, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -1963,6 +2100,18 @@ class Service:
             self._drop_expired_leases(run, now_ms)
             lease = instance.get("lease")
             if lease is not None:
+                # A heartbeat-expired lease is stuck on the instance: its own
+                # claim id can no longer submit, only the hang detector reaps.
+                if (
+                    has_claim
+                    and claim_id == lease["claim_id"]
+                    and self._lease_heartbeat_expired(lease, now_ms)
+                ):
+                    raise ApiError(
+                        409,
+                        "heartbeat_expired",
+                        f"claim {claim_id!r} has missed its heartbeat deadline",
+                    )
                 # A leased instance only accepts its own live claim. Offering
                 # another still-active lease (of any instance in the run) is
                 # a conflict; expired/consumed/unknown/foreign ids are simply
@@ -2076,6 +2225,79 @@ class Service:
                 }
                 timed_out.append(instance["instance_id"])
             return {"timed_out": timed_out, "run": self._run_report(run)}
+
+    def check_hangs(self, run_id: str, payload: object) -> dict:
+        """Detect leased instances whose heartbeat deadline has elapsed.
+
+        Only pending instances holding a heartbeat-enabled lease whose
+        ``heartbeat_deadline_at`` has been reached are considered. Each hit
+        consumes the lease and writes an ``error`` result atomically, so a
+        concurrent heartbeat or result submission for the same claim can no
+        longer succeed; the pool allocation is released with the lease. When
+        the frozen hard timeout has elapsed at the same time, the existing
+        timeout result is written instead and the instance is not listed as
+        hung. The run is never auto-completed.
+        """
+        if not isinstance(payload, dict):
+            raise _validation("request body must be a JSON object")
+        if payload:
+            raise _validation(f"unknown fields: {', '.join(sorted(payload))}")
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise ApiError(404, "run_not_found", f"run {run_id!r} not found")
+            if run["status"] == "completed":
+                raise ApiError(
+                    409, "run_completed", f"run {run_id!r} is already completed"
+                )
+            now_ms = _now_ms()
+            # Expired leases vanish silently exactly as in claims/results;
+            # heartbeat-expired ones survive the sweep and are reaped below.
+            self._drop_expired_leases(run, now_ms)
+
+            hung: list[str] = []
+            for instance, context in zip(run["instances"], run["contexts"]):
+                if instance["outcome"] != "pending":
+                    continue
+                lease = instance.get("lease")
+                if lease is None:
+                    continue
+                if not self._lease_heartbeat_expired(lease, now_ms):
+                    continue
+                timeout_seconds = context["timeout_seconds"]
+                timeout_ms = timeout_seconds * 1000
+                deadline_at = lease["claimed_at"] + timeout_ms
+                # Consume the lease and write the result atomically, exactly
+                # as the timeout detector does; a late heartbeat or submit
+                # carrying the old claim id then fails and cannot overwrite.
+                lease["consumed"] = True
+                instance.pop("lease", None)
+                instance["outcome"] = "error"
+                if now_ms >= deadline_at:
+                    # The hard timeout takes precedence: same result shape as
+                    # check_timeouts, and the instance is not listed as hung.
+                    instance["duration_ms"] = timeout_ms
+                    instance["details"] = {
+                        "code": "timeout",
+                        "timeout_seconds": timeout_seconds,
+                        "worker_id": lease["worker_id"],
+                        "claimed_at": lease["claimed_at"],
+                        "deadline_at": deadline_at,
+                        "detected_at": now_ms,
+                    }
+                    continue
+                instance["duration_ms"] = max(0, now_ms - lease["claimed_at"])
+                instance["details"] = {
+                    "code": "hung",
+                    "worker_id": lease["worker_id"],
+                    "claimed_at": lease["claimed_at"],
+                    "last_heartbeat_at": lease["last_heartbeat_at"],
+                    "heartbeat_deadline_at": lease["heartbeat_deadline_at"],
+                    "detected_at": now_ms,
+                }
+                hung.append(instance["instance_id"])
+            return {"hung": hung, "run": self._run_report(run)}
 
     def complete_run(self, run_id: str) -> dict:
         with self._lock:
