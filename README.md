@@ -145,15 +145,17 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 提交实例结果时可携带可选 `coverage` 字段，与结果原子写入：片段不合规时整个提交返回 400 `validation_error`，实例保持 `pending`，结果与覆盖数据均不保存。`coverage` 只能含 `files` 字段；`files` 是非空对象，键为非空文件路径，值只能包含必填的 `executable_lines` 与 `covered_lines`：
 
 - 两者均为无重复正整数数组；`executable_lines` 不得为空，`covered_lines` 可以为空但必须是 `executable_lines` 的子集；布尔值、非整数、零与负数均不合规。
+- 文件可同时携带可选的分支覆盖：`executable_branches` 与 `covered_branches` 必须成对出现（只给一个即 400 `validation_error`），二者均为坐标对象数组，每个元素仅含 `line`（正整数）与 `branch`（非负整数）两个字段；`executable_branches` 不得为空或含重复坐标，`covered_branches` 不得重复且必须是 `executable_branches` 的子集。缺省这对字段表示该文件未提供分支信息；只提交行号的客户端保持兼容。
 - 单个片段最多 1000 个文件，合计最多 100000 个可执行行号（按文件内去重后的数量求和）。
-- 缺省 `coverage` 表示该实例不附带覆盖；显式提供时必须是合规的覆盖对象，`null` 或其他类型均返回 400 `validation_error`。`files` 为空或不是对象、文件值不是对象、缺少任一行号字段、文件条目含未知字段、`coverage` 含 `files` 之外字段、空路径等同样返回 400 `validation_error`。
-- 覆盖片段按运行独立累积，与结果在同一提交内一并写入；片段内文件声明顺序与行号顺序均无语义，存储时按路径与行号归一化，响应对象与提交对象完全隔离。
+- 缺省 `coverage` 表示该实例不附带覆盖；显式提供时必须是合规的覆盖对象，`null` 或其他类型均返回 400 `validation_error`。`files` 为空或不是对象、文件值不是对象、缺少任一行号字段、文件条目含未知字段、`coverage` 含 `files` 之外字段、空路径等同样返回 400 `validation_error`；分支字段的类型、成员、坐标、集合或子集关系不合规亦然，整个结果不写入，实例保持 `pending`。
+- 覆盖片段按运行独立累积，与结果在同一提交内一并写入；片段内文件声明顺序与行号、分支坐标顺序均无语义，存储时按路径与行号、坐标归一化，响应对象与提交对象完全隔离。
 
 `GET /v1/runs/{run_id}/coverage` 对**已完成**运行只读合并全部实例片段（200，`application/json; charset=utf-8`），不修改任何数据；重复读取同一运行返回顺序与内容稳定的结果。
 
-- 相同路径的可执行行与已覆盖行分别取并集；文件按路径的 Unicode 码点顺序返回，每个文件的行号数组升序返回。
+- 相同路径的可执行行与已覆盖行分别取并集；文件按路径的 Unicode 码点顺序返回，每个文件的行号数组升序返回。分支坐标同样按文件分别合并可执行与已覆盖集合，并按 `line`、`branch` 升序输出。
 - 每个文件含 `path`、`executable_lines`、`covered_lines`、`missed_lines` 与 `coverage_percent`；`missed_lines` 为可执行行减去已覆盖行，百分比为已覆盖数 ÷ 可执行数 × 100 后四舍五入到两位小数（如 `2/3 → 66.67`）。
-- 顶层返回 `run_id`、`summary` 与 `files`；`summary` 含 `files`（文件数）、`executable_lines`、`covered_lines`、`missed_lines` 及同口径 `coverage_percent`。没有任何覆盖片段时 `files` 为空数组、各计数为零、`coverage_percent` 为 `null`。
+- 提供了分支信息的文件另含 `branches`（`executable`、`covered`、`missed` 计数及同口径 `coverage_percent`）与 `missed_branches`（未覆盖分支坐标数组）；未提供分支信息的文件不补这些字段。
+- 顶层返回 `run_id`、`summary` 与 `files`；`summary` 含 `files`（文件数）、`executable_lines`、`covered_lines`、`missed_lines` 及同口径 `coverage_percent`。没有任何覆盖片段时 `files` 为空数组、各计数为零、`coverage_percent` 为 `null`。运行含分支信息时 `summary` 另含 `branches`（全部分支文件的合计计数与同口径 `coverage_percent`）；全程无分支信息时覆盖率 JSON 与行覆盖结构完全一致。
 - 运行不存在返回 404 `run_not_found`；运行尚未完成返回 409 `run_incomplete`。
 - 重试运行不继承源运行（或任一祖先运行）的覆盖片段，只汇总重试实例在新运行中提交的片段；源运行的覆盖数据不受重试及其后续提交影响。
 - 该入口不改变运行报告结构、完成判定、重试筛选、JUnit XML 导出、跨运行聚合以及目录与快照入口；未知路由仍返回 404 `not_found`。
@@ -191,7 +193,7 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - `archive_version`：固定为整数 `1`。
 - `run`：与 `GET /v1/runs/{run_id}` 完全相同的完整报告（含 `id`、`status`、`passed`、按冻结顺序的实例完整结果明细与可重算的 `summary`；重试运行另含 `retry_of`、`root_run_id`、`attempt`）。
 - `contexts`：按冻结实例顺序排列的上下文数组，每项含 `case_name`、`kind`、`parameters`、`timeout_seconds`、`setup`、`steps`、`teardown`；仅当冻结时存在资源需求时才含 `resource_requirements`。
-- `coverage`：`{"files": [...]}`，保存覆盖率入口所需的规范化合并结果——文件按路径 Unicode 码点排序，每个文件含 `path`、升序无重复的 `executable_lines` 与作为其子集的 `covered_lines`；无覆盖片段时 `files` 为空数组。
+- `coverage`：`{"files": [...]}`，保存覆盖率入口所需的规范化合并结果——文件按路径 Unicode 码点排序，每个文件含 `path`、升序无重复的 `executable_lines` 与作为其子集的 `covered_lines`；含分支信息的文件另含 `executable_branches` 与 `covered_branches`，均为按 `line`、`branch` 升序的坐标对象数组（已覆盖为可执行的子集）；无覆盖片段时 `files` 为空数组。
 
 归档不包含目录对象、夹具/快照/资源池定义、租约或任何其他运行。
 
@@ -199,7 +201,7 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 - 校验：归档必须是对象且只含四个顶层字段；`archive_version` 必须为 `1`（布尔值、字符串、小数均不合规）。`run` 的字段集合、类型、取值逐项校验：`status` 必须为 `completed`；实例数组非空，每个实例的 `instance_id` 在运行内唯一，所有 `outcome` 均非 `pending` 且属于现有取值；`duration_ms` 为非负整数；`summary` 必须能由实例结果逐项重算得到，`passed` 必须与失败/错误计数一致。
 - `contexts` 必须与 `run.instances` 一一对应（数量相等、按冻结顺序配对），每项的名称与参数与配对实例一致，并满足现有的 kind、超时（1–86400 整数）、步骤与夹具分组（`{"fixture_id", "steps"}`）及资源需求约束。
-- `coverage.files` 必须为数组，路径非空且不重复，行号为升序无重复正整数，可执行行非空，已覆盖行是其子集；文件与行的总量不限（合并口径而非片段口径）。
+- `coverage.files` 必须为数组，路径非空且不重复，行号为升序无重复正整数，可执行行非空，已覆盖行是其子集；分支字段（如有）必须成对出现，坐标为升序无重复的 `{"line", "branch"}` 对象，可执行分支非空，已覆盖分支是其子集；分支覆盖出现前的旧归档不含这两个字段，仍可正常导入。文件与行的总量不限（合并口径而非片段口径）。
 - 谱系自洽：普通运行不得出现 `retry_of`/`root_run_id`/`attempt` 中的任一个；重试运行三者必须同时出现且 `attempt` 为正整数、`retry_of` 不得指向自身、首次重试的 `root_run_id` 必须等于 `retry_of`。重试归档按冻结谱系恢复，**即使祖先运行从未导入**也允许恢复，并可继续链式重试与参与聚合。
 - 运行不存在返回 404 `run_not_found`；导出 `open` 运行返回 409 `run_incomplete`。
 - 畸形 JSON 返回 400 `invalid_json`；请求体非对象、字段缺失或未知、版本不支持、类型错误或内容不一致返回 400 `validation_error`；目标 `id` 已存在返回 409 `run_exists`。任何导入失败都不占用 `id`，也不留下运行或覆盖率的部分状态；全部校验在写入前完成。
@@ -225,12 +227,13 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 ### CI 门禁判定
 
-`POST /v1/ci/gates/evaluate` 按显式策略对多个**已完成**运行做只读门禁判定（200），普通、重试及归档恢复运行一视同仁。请求体只允许 `run_ids` 与 `policy` 两个字段：`run_ids` 为按时间由旧到新排列的 1 至 100 个不重复非空运行 id，末项即当前运行；`policy` 为非空对象，只可含 `max_failed`、`max_error`、`min_coverage_percent` 与 `max_flaky`。判定只使用冻结的实例结果与合并覆盖率，不修改运行、覆盖率、目录、归档或租约，相同输入的响应顺序与内容完全一致。
+`POST /v1/ci/gates/evaluate` 按显式策略对多个**已完成**运行做只读门禁判定（200），普通、重试及归档恢复运行一视同仁。请求体只允许 `run_ids` 与 `policy` 两个字段：`run_ids` 为按时间由旧到新排列的 1 至 100 个不重复非空运行 id，末项即当前运行；`policy` 为非空对象，只可含 `max_failed`、`max_error`、`min_coverage_percent`、`min_branch_coverage_percent` 与 `max_flaky`。判定只使用冻结的实例结果与合并覆盖率，不修改运行、覆盖率、目录、归档或租约，相同输入的响应顺序与内容完全一致。
 
-- 三个 max 字段为非负整数；`min_coverage_percent` 为 0 至 100 的有限数字（布尔值不算数字，`NaN`/`Infinity` 不合规）；提供 `max_flaky` 时 `run_ids` 至少包含两个运行。
-- 成功响应含 `current_run_id`、`run_count`、`passed` 与 `checks`。`checks` 只含请求的策略项，固定按 `max_failed`、`max_error`、`min_coverage_percent`、`max_flaky` 排列，与请求中的声明顺序无关；每项含 `name`、`passed`、`actual` 与 `limit`。顶层 `passed` 仅在全部检查通过时为 `true`。
+- 三个 max 字段为非负整数；`min_coverage_percent` 与 `min_branch_coverage_percent` 为 0 至 100 的有限数字（布尔值不算数字，`NaN`/`Infinity` 不合规）；提供 `max_flaky` 时 `run_ids` 至少包含两个运行。未知字段或非法值返回 400 `validation_error`。
+- 成功响应含 `current_run_id`、`run_count`、`passed` 与 `checks`。`checks` 只含请求的策略项，固定按 `max_failed`、`max_error`、`min_coverage_percent`、`branch_coverage`、`max_flaky` 排列，与请求中的声明顺序无关；每项含 `name`、`passed`、`actual` 与 `limit`（`branch_coverage` 为 `name`、`passed`、`threshold`、`actual`）。顶层 `passed` 仅在全部检查通过时为 `true`。
 - `max_failed`/`max_error` 的 `actual` 取**当前运行**（末项）最终结果的失败数与错误数，`actual <= limit` 通过。
 - `min_coverage_percent` 的 `actual` 取**当前运行**覆盖率入口同口径的合并总百分比（已覆盖数 ÷ 可执行数 × 100，四舍五入到两位小数），`actual >= limit` 通过；当前运行没有可执行行时 `actual` 为 `null` 且该检查不通过（即使 limit 为 0）。
+- `min_branch_coverage_percent` 以**当前运行**的合并分支覆盖率判定（已覆盖分支数 ÷ 可执行分支数 × 100，四舍五入到两位小数），`actual >= threshold` 通过；当前运行无分支信息时该检查失败，`actual` 为 `null`，并带 `code` 为 `branch_coverage_unavailable`。缺省该策略项时不产生此检查，既有门禁不变。
 - `max_flaky` 的 `actual` 为所有请求运行中的波动实例数：实例以 `case_id` 与 `instance_id` 联合识别，观测时忽略 `skipped`；某实例的非 skipped 观测至少两次，且同时出现 `passed` 与 `failed` 或 `error` 时计为 flaky（仅 `failed`/`error` 互现不算）；某次运行不含该实例时不补观测。`actual <= limit` 通过。
 - 畸形 JSON 返回 400 `invalid_json`；请求结构、字段、数量、重复项、空策略或数值范围不合法均返回 400 `validation_error`。结构校验后按 `run_ids` 顺序读取运行，首个不存在的运行返回 404 `run_not_found`，首个未完成的运行返回 409 `run_incomplete`，不返回部分结果。现有报告、稳定性、覆盖率、JUnit、诊断入口及未知路由行为不变。
 

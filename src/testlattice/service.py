@@ -31,6 +31,7 @@ GATE_POLICY_FIELDS = (
     "max_failed",
     "max_error",
     "min_coverage_percent",
+    "min_branch_coverage_percent",
     "max_flaky",
 )
 GATE_INTEGER_FIELDS = ("max_failed", "max_error", "max_flaky")
@@ -165,16 +166,62 @@ def _validate_line_numbers(value: object, field: str, *, allow_empty: bool) -> l
     return lines
 
 
-def _validate_coverage(value: object) -> dict[str, dict[str, list[int]]]:
+def _validate_branch_coordinates(
+    value: object, field: str, *, allow_empty: bool
+) -> list[tuple[int, int]]:
+    """Unique (line, branch) coordinates; request order is normalized.
+
+    Each element is an object with exactly ``line`` (positive integer) and
+    ``branch`` (non-negative integer); booleans are not integers.
+    """
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    if not allow_empty and not value:
+        raise _validation(f"{field} must not be empty")
+    coordinates: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for index, item in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(item, dict):
+            raise _validation(f"{item_field} must be a JSON object")
+        unknown = set(item) - {"line", "branch"}
+        if unknown:
+            raise _validation(
+                f"{item_field} unknown fields: {', '.join(sorted(unknown))}"
+            )
+        if "line" not in item:
+            raise _validation(f"{item_field}.line is required")
+        if "branch" not in item:
+            raise _validation(f"{item_field}.branch is required")
+        line = item["line"]
+        if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+            raise _validation(f"{item_field}.line must be a positive integer")
+        branch = item["branch"]
+        if isinstance(branch, bool) or not isinstance(branch, int) or branch < 0:
+            raise _validation(f"{item_field}.branch must be a non-negative integer")
+        coordinate = (line, branch)
+        if coordinate in seen:
+            raise _validation(f"{field} must not contain duplicates")
+        seen.add(coordinate)
+        coordinates.append(coordinate)
+    coordinates.sort()
+    return coordinates
+
+
+def _validate_coverage(value: object) -> dict[str, dict[str, list]]:
     """Validate the optional coverage fragment attached to one instance result.
 
     Only ``files`` is allowed: a non-empty object keyed by non-empty file
     paths whose values contain exactly ``executable_lines`` (a non-empty
     unique positive-int array) and ``covered_lines`` (a possibly empty
-    unique positive-int array that must be a subset). Limited to
+    unique positive-int array that must be a subset). A file may
+    additionally carry branch information as the ``executable_branches`` /
+    ``covered_branches`` pair: both or neither, each an array of
+    ``{"line", "branch"}`` coordinate objects with no duplicates, the
+    executable set non-empty and the covered set a subset of it. Limited to
     MAX_COVERAGE_FILES files and MAX_COVERAGE_EXECUTABLE_LINES executable
     line numbers in total. Stored as normalized {path: {executable,
-    covered}} sets; request file/line order is never significant.
+    covered}} sets; request file/line/branch order is never significant.
     """
     if not isinstance(value, dict):
         raise _validation("coverage must be a JSON object")
@@ -193,14 +240,19 @@ def _validate_coverage(value: object) -> dict[str, dict[str, list[int]]]:
             f"coverage must contain at most {MAX_COVERAGE_FILES} files"
         )
 
-    normalized: dict[str, dict[str, list[int]]] = {}
+    normalized: dict[str, dict[str, list]] = {}
     total_executable = 0
     for path, entry in files.items():
         if not isinstance(path, str) or path == "":
             raise _validation("coverage file paths must be non-empty strings")
         if not isinstance(entry, dict):
             raise _validation(f"coverage.files.{path} must be a JSON object")
-        entry_unknown = set(entry) - {"executable_lines", "covered_lines"}
+        entry_unknown = set(entry) - {
+            "executable_lines",
+            "covered_lines",
+            "executable_branches",
+            "covered_branches",
+        }
         if entry_unknown:
             raise _validation(
                 f"coverage.files.{path} unknown fields: "
@@ -235,20 +287,61 @@ def _validate_coverage(value: object) -> dict[str, dict[str, list[int]]]:
                 "coverage must contain at most "
                 f"{MAX_COVERAGE_EXECUTABLE_LINES} executable line numbers in total"
             )
-        normalized[path] = {"executable_lines": executable, "covered_lines": covered}
+        normalized_entry: dict[str, list] = {
+            "executable_lines": executable,
+            "covered_lines": covered,
+        }
+        # Branch information is optional per file, but the two arrays always
+        # travel as a pair; omitting both means "no branch data".
+        has_executable_branches = "executable_branches" in entry
+        if has_executable_branches != ("covered_branches" in entry):
+            raise _validation(
+                f"coverage.files.{path} must provide executable_branches and "
+                "covered_branches together"
+            )
+        if has_executable_branches:
+            executable_branches = _validate_branch_coordinates(
+                entry["executable_branches"],
+                f"coverage.files.{path}.executable_branches",
+                allow_empty=False,
+            )
+            covered_branches = _validate_branch_coordinates(
+                entry["covered_branches"],
+                f"coverage.files.{path}.covered_branches",
+                allow_empty=True,
+            )
+            if not set(covered_branches).issubset(executable_branches):
+                raise _validation(
+                    f"coverage.files.{path}.covered_branches must be a subset "
+                    "of executable_branches"
+                )
+            normalized_entry["executable_branches"] = executable_branches
+            normalized_entry["covered_branches"] = covered_branches
+        normalized[path] = normalized_entry
     return normalized
 
 
 def _merge_coverage(
-    target: dict[str, dict[str, set[int]]], fragment: dict[str, dict[str, list[int]]]
+    target: dict[str, dict[str, set]], fragment: dict[str, dict[str, list]]
 ) -> None:
-    """Union one validated fragment into the run-level coverage accumulator."""
+    """Union one validated fragment into the run-level coverage accumulator.
+
+    Branch coordinate sets appear on a file only once a fragment actually
+    carries branch information for it; files without any branch fragment
+    keep no branch keys at all.
+    """
     for path, entry in fragment.items():
         merged = target.get(path)
         if merged is None:
             merged = target[path] = {"executable_lines": set(), "covered_lines": set()}
         merged["executable_lines"].update(entry["executable_lines"])
         merged["covered_lines"].update(entry["covered_lines"])
+        if "executable_branches" in entry:
+            if "executable_branches" not in merged:
+                merged["executable_branches"] = set()
+                merged["covered_branches"] = set()
+            merged["executable_branches"].update(entry["executable_branches"])
+            merged["covered_branches"].update(entry["covered_branches"])
 
 
 def _coverage_percent(covered: int, executable: int) -> float:
@@ -447,21 +540,31 @@ def _archive_context_view(instance: dict, context: dict) -> dict:
 
 
 def _archive_coverage_files(
-    accumulated: dict[str, dict[str, set[int]]],
+    accumulated: dict[str, dict[str, set]],
 ) -> list[dict]:
     """Normalized merged coverage for an archive: files ordered by Unicode
     code point of path, line number arrays strictly ascending, covered lines
-    a subset of executable lines."""
+    a subset of executable lines. Files with branch information also carry
+    the ``executable_branches``/``covered_branches`` pair as ``{"line",
+    "branch"}`` arrays sorted by (line, branch)."""
     files: list[dict] = []
     for path in sorted(accumulated):
         entry = accumulated[path]
-        files.append(
-            {
-                "path": path,
-                "executable_lines": sorted(entry["executable_lines"]),
-                "covered_lines": sorted(entry["covered_lines"]),
-            }
-        )
+        archived = {
+            "path": path,
+            "executable_lines": sorted(entry["executable_lines"]),
+            "covered_lines": sorted(entry["covered_lines"]),
+        }
+        if "executable_branches" in entry:
+            archived["executable_branches"] = [
+                {"line": line, "branch": branch}
+                for line, branch in sorted(entry["executable_branches"])
+            ]
+            archived["covered_branches"] = [
+                {"line": line, "branch": branch}
+                for line, branch in sorted(entry["covered_branches"])
+            ]
+        files.append(archived)
     return files
 
 
@@ -594,14 +697,59 @@ def _archive_sorted_lines(value: object, field: str, *, allow_empty: bool) -> li
     return lines
 
 
-def _archive_coverage_in(value: object) -> dict[str, dict[str, set[int]]]:
+def _archive_sorted_branches(
+    value: object, field: str, *, allow_empty: bool
+) -> list[tuple[int, int]]:
+    """Unique (line, branch) coordinates already normalized into ascending
+    (line, branch) order; each element holds exactly ``line`` (positive
+    integer) and ``branch`` (non-negative integer)."""
+    if not isinstance(value, list):
+        raise _validation(f"{field} must be an array")
+    if not allow_empty and not value:
+        raise _validation(f"{field} must not be empty")
+    coordinates: list[tuple[int, int]] = []
+    previous: tuple[int, int] | None = None
+    for index, item in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(item, dict):
+            raise _validation(f"{item_field} must be a JSON object")
+        unknown = set(item) - {"line", "branch"}
+        if unknown:
+            raise _validation(
+                f"{item_field} unknown fields: {', '.join(sorted(unknown))}"
+            )
+        if "line" not in item:
+            raise _validation(f"{item_field}.line is required")
+        if "branch" not in item:
+            raise _validation(f"{item_field}.branch is required")
+        line = item["line"]
+        if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+            raise _validation(f"{item_field}.line must be a positive integer")
+        branch = item["branch"]
+        if isinstance(branch, bool) or not isinstance(branch, int) or branch < 0:
+            raise _validation(f"{item_field}.branch must be a non-negative integer")
+        coordinate = (line, branch)
+        if previous is not None and coordinate <= previous:
+            raise _validation(
+                f"{field} must contain unique coordinates in ascending order"
+            )
+        previous = coordinate
+        coordinates.append(coordinate)
+    return coordinates
+
+
+def _archive_coverage_in(value: object) -> dict[str, dict[str, set]]:
     """Validate archived normalized coverage into the internal accumulator
     shape ({path: {"executable_lines": set, "covered_lines": set}}).
 
     The merged archive (unlike per-result fragments) may hold any number of
     files or lines, but every file still obeys the existing line constraints:
     non-empty unique ascending positive executable lines, with covered lines
-    a unique ascending subset.
+    a unique ascending subset. A file may additionally carry the
+    ``executable_branches``/``covered_branches`` pair (both or neither):
+    unique ascending ``{"line", "branch"}`` coordinates, the executable set
+    non-empty and the covered set a subset of it. Archives written before
+    branch coverage existed simply omit both fields.
     """
     if not isinstance(value, dict):
         raise _validation("coverage must be a JSON object")
@@ -616,13 +764,19 @@ def _archive_coverage_in(value: object) -> dict[str, dict[str, set[int]]]:
     if not isinstance(files_value, list):
         raise _validation("coverage.files must be an array")
 
-    accumulated: dict[str, dict[str, set[int]]] = {}
+    accumulated: dict[str, dict[str, set]] = {}
     previous_path: str | None = None
     for index, entry in enumerate(files_value):
         field = f"coverage.files[{index}]"
         if not isinstance(entry, dict):
             raise _validation(f"{field} must be a JSON object")
-        entry_unknown = set(entry) - {"path", "executable_lines", "covered_lines"}
+        entry_unknown = set(entry) - {
+            "path",
+            "executable_lines",
+            "covered_lines",
+            "executable_branches",
+            "covered_branches",
+        }
         if entry_unknown:
             raise _validation(
                 f"{field} unknown fields: {', '.join(sorted(entry_unknown))}"
@@ -652,10 +806,35 @@ def _archive_coverage_in(value: object) -> dict[str, dict[str, set[int]]]:
             raise _validation(
                 f"{field}.covered_lines must be a subset of executable_lines"
             )
-        accumulated[path] = {
+        accumulated_entry: dict[str, set] = {
             "executable_lines": set(executable),
             "covered_lines": set(covered),
         }
+        has_executable_branches = "executable_branches" in entry
+        if has_executable_branches != ("covered_branches" in entry):
+            raise _validation(
+                f"{field} must provide executable_branches and "
+                "covered_branches together"
+            )
+        if has_executable_branches:
+            executable_branches = _archive_sorted_branches(
+                entry["executable_branches"],
+                f"{field}.executable_branches",
+                allow_empty=False,
+            )
+            covered_branches = _archive_sorted_branches(
+                entry["covered_branches"],
+                f"{field}.covered_branches",
+                allow_empty=True,
+            )
+            if not set(covered_branches).issubset(executable_branches):
+                raise _validation(
+                    f"{field}.covered_branches must be a subset of "
+                    "executable_branches"
+                )
+            accumulated_entry["executable_branches"] = set(executable_branches)
+            accumulated_entry["covered_branches"] = set(covered_branches)
+        accumulated[path] = accumulated_entry
     return accumulated
 
 
@@ -673,8 +852,9 @@ class Service:
         self._snapshots: dict[str, dict] = {}
         self._pools: dict[str, dict] = {}
         self._runs: dict[str, dict] = {}
-        # Run id -> {path: {"executable_lines": set[int], "covered_lines": set[int]}}
-        self._coverage: dict[str, dict[str, dict[str, set[int]]]] = {}
+        # Run id -> {path: {"executable_lines": set[int], "covered_lines": set[int],
+        # optional "executable_branches"/"covered_branches": set[(line, branch)]}}
+        self._coverage: dict[str, dict[str, dict[str, set]]] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -1387,8 +1567,10 @@ class Service:
         """Read-only merged coverage report for a completed run.
 
         Unions the executable and covered line sets of every fragment
-        submitted to this run; nothing is mutated, so repeated reads of the
-        same completed run return byte-identical order and counts.
+        submitted to this run; branch coordinates merge the same way per
+        file. Nothing is mutated, so repeated reads of the same completed
+        run return byte-identical order and counts. Runs without any branch
+        information produce exactly the line-only report shape.
         """
         with self._lock:
             run = self._runs.get(run_id)
@@ -1403,23 +1585,53 @@ class Service:
             files: list[dict] = []
             total_executable = 0
             total_covered = 0
+            total_executable_branches = 0
+            total_covered_branches = 0
+            has_branches = False
             for path in sorted(accumulated):
                 entry = accumulated[path]
                 executable = sorted(entry["executable_lines"])
                 covered_set = entry["covered_lines"]
                 covered = [line for line in executable if line in covered_set]
                 missed = [line for line in executable if line not in covered_set]
-                files.append(
-                    {
-                        "path": path,
-                        "executable_lines": executable,
-                        "covered_lines": covered,
-                        "missed_lines": missed,
+                file_entry: dict = {
+                    "path": path,
+                    "executable_lines": executable,
+                    "covered_lines": covered,
+                    "missed_lines": missed,
+                    "coverage_percent": _coverage_percent(
+                        len(covered), len(executable)
+                    ),
+                }
+                if "executable_branches" in entry:
+                    has_branches = True
+                    executable_branches = sorted(entry["executable_branches"])
+                    covered_branch_set = entry["covered_branches"]
+                    covered_branches = [
+                        coordinate
+                        for coordinate in executable_branches
+                        if coordinate in covered_branch_set
+                    ]
+                    missed_branches = [
+                        coordinate
+                        for coordinate in executable_branches
+                        if coordinate not in covered_branch_set
+                    ]
+                    file_entry["branches"] = {
+                        "executable": len(executable_branches),
+                        "covered": len(covered_branches),
+                        "missed": len(missed_branches),
                         "coverage_percent": _coverage_percent(
-                            len(covered), len(executable)
+                            len(covered_branches), len(executable_branches)
                         ),
                     }
-                )
+                    file_entry["missed_branches"] = [
+                        {"line": line, "branch": branch}
+                        for line, branch in missed_branches
+                    ]
+                    total_executable_branches += len(executable_branches)
+                    total_covered_branches += len(covered_branches)
+                files.append(file_entry)
                 total_executable += len(executable)
                 total_covered += len(covered)
 
@@ -1429,15 +1641,25 @@ class Service:
                 if total_executable
                 else None
             )
+            summary: dict = {
+                "files": len(files),
+                "executable_lines": total_executable,
+                "covered_lines": total_covered,
+                "missed_lines": total_missed,
+                "coverage_percent": percent,
+            }
+            if has_branches:
+                summary["branches"] = {
+                    "executable": total_executable_branches,
+                    "covered": total_covered_branches,
+                    "missed": total_executable_branches - total_covered_branches,
+                    "coverage_percent": _coverage_percent(
+                        total_covered_branches, total_executable_branches
+                    ),
+                }
             return {
                 "run_id": run_id,
-                "summary": {
-                    "files": len(files),
-                    "executable_lines": total_executable,
-                    "covered_lines": total_covered,
-                    "missed_lines": total_missed,
-                    "coverage_percent": percent,
-                },
+                "summary": summary,
                 "files": files,
             }
 
@@ -1583,12 +1805,16 @@ class Service:
             "contexts": copy.deepcopy(contexts),
             **lineage,
         }
-        coverage: dict[str, dict[str, set[int]]] = {}
+        coverage: dict[str, dict[str, set]] = {}
         for path, entry in coverage_map.items():
-            coverage[path] = {
+            restored: dict[str, set] = {
                 "executable_lines": set(entry["executable_lines"]),
                 "covered_lines": set(entry["covered_lines"]),
             }
+            if "executable_branches" in entry:
+                restored["executable_branches"] = set(entry["executable_branches"])
+                restored["covered_branches"] = set(entry["covered_branches"])
+            coverage[path] = restored
 
         with self._lock:
             if run_id in self._runs:
@@ -2683,17 +2909,18 @@ class Service:
                 if value < 0:
                     raise _validation(f"policy.{name} must be a non-negative integer")
                 limits[name] = value
-        if "min_coverage_percent" in policy_value:
-            value = policy_value["min_coverage_percent"]
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise _validation(
-                    "policy.min_coverage_percent must be a finite number between 0 and 100"
-                )
-            if not math.isfinite(value) or not 0 <= value <= 100:
-                raise _validation(
-                    "policy.min_coverage_percent must be a finite number between 0 and 100"
-                )
-            limits["min_coverage_percent"] = value
+        for name in ("min_coverage_percent", "min_branch_coverage_percent"):
+            if name in policy_value:
+                value = policy_value[name]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise _validation(
+                        f"policy.{name} must be a finite number between 0 and 100"
+                    )
+                if not math.isfinite(value) or not 0 <= value <= 100:
+                    raise _validation(
+                        f"policy.{name} must be a finite number between 0 and 100"
+                    )
+                limits[name] = value
         if "max_flaky" in limits and len(run_ids) < MIN_GATE_FLAKY_RUNS:
             raise _validation(
                 "policy.max_flaky requires at least two runs"
@@ -2764,6 +2991,41 @@ class Service:
                         "limit": limit,
                     }
                 )
+            if "min_branch_coverage_percent" in limits:
+                limit = limits["min_branch_coverage_percent"]
+                accumulated = self._coverage.get(current["id"], {})
+                total_executable = sum(
+                    len(entry["executable_branches"])
+                    for entry in accumulated.values()
+                    if "executable_branches" in entry
+                )
+                if total_executable == 0:
+                    # No branch information at all: branch coverage is
+                    # undefined and the gate cannot pass.
+                    checks.append(
+                        {
+                            "name": "branch_coverage",
+                            "passed": False,
+                            "threshold": limit,
+                            "actual": None,
+                            "code": "branch_coverage_unavailable",
+                        }
+                    )
+                else:
+                    total_covered = sum(
+                        len(entry["covered_branches"])
+                        for entry in accumulated.values()
+                        if "covered_branches" in entry
+                    )
+                    actual = _coverage_percent(total_covered, total_executable)
+                    checks.append(
+                        {
+                            "name": "branch_coverage",
+                            "passed": actual >= limit,
+                            "threshold": limit,
+                            "actual": actual,
+                        }
+                    )
             if "max_flaky" in limits:
                 limit = limits["max_flaky"]
                 # Flaky instances are keyed by (case_id, instance_id); skipped
