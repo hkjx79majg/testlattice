@@ -357,6 +357,14 @@ class Handler(BaseHTTPRequestHandler):
         if run_id is not None:
             self.handle_check_timeouts(run_id)
             return
+        run_id = _subresource(parts.path, "/v1/runs/", "/heartbeats")
+        if run_id is not None:
+            self.handle_send_heartbeat(run_id)
+            return
+        run_id = _subresource(parts.path, "/v1/runs/", "/hangs")
+        if run_id is not None:
+            self.handle_detect_hangs(run_id)
+            return
         run_id = _subresource(parts.path, "/v1/runs/", "/complete")
         if run_id is not None:
             self.handle_complete_run(run_id)
@@ -506,6 +514,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self.read_body()
             result = self.service.check_timeouts(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, result)
+
+    def handle_send_heartbeat(self, run_id: str) -> None:
+        try:
+            payload = self.read_body()
+            claim = self.service.send_heartbeat(run_id, payload)
+        except ApiError as error:
+            self.send_api_error(error)
+            return
+        self.send_json(200, claim)
+
+    def handle_detect_hangs(self, run_id: str) -> None:
+        try:
+            payload = self.read_body()
+            result = self.service.detect_hangs(run_id, payload)
         except ApiError as error:
             self.send_api_error(error)
             return

@@ -86,11 +86,13 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 
 ### 租约式并行领取
 
-多个工作进程通过 `POST /v1/runs/{run_id}/claims` 租约领取待执行实例，普通运行与重试运行中的 pending 实例均可被领取，领取过程在服务锁内原子完成，并发请求不会让同一实例同时持有两个有效租约。请求体只允许 `worker_id`、`max_items`、`lease_seconds`：
+多个工作进程通过 `POST /v1/runs/{run_id}/claims` 租约领取待执行实例，普通运行与重试运行中的 pending 实例均可被领取，领取过程在服务锁内原子完成，并发请求不会让同一实例同时持有两个有效租约。请求体只允许 `worker_id`、`max_items`、`lease_seconds`、`heartbeat_seconds`：
 
 - `worker_id`：必填字符串，去除首尾空白后须非空；`max_items` 缺省为 1，提供时必须是 1 至 100 的整数；`lease_seconds` 必填，为 1 至 3600 的整数。布尔值、小数、字符串或 `null` 均不合规。
-- 响应 200 为 `{"claims": [...]}`；按冻结顺序扫描实例，跳过已有有效租约与已有结果的实例，至多选取 `max_items` 个；没有可领实例时返回 200 与空 `claims`。
+- `heartbeat_seconds` 可选，缺省表示不启用心跳；提供时必须是 1 至 300 且严格小于 `lease_seconds` 的非布尔整数，布尔值、小数、字符串或 `null` 均不合规。
+- 响应 200 为 `{"claims": [...]}`；按冻结顺序扫描实例，跳过已有有效租约（含心跳已逾期但硬超时未到的租约）与已有结果的实例，至多选取 `max_items` 个；没有可领实例时返回 200 与空 `claims`。
 - 每项含唯一且不透明的 `claim_id`，以及 `instance_id`、`case_id`、`case_name`、`kind`、`parameters`、`timeout_seconds`、`setup`、`steps`、`teardown`（上下文与诊断导出口径一致，均为创建/重试时的冻结副本）和纪元毫秒整数 `expires_at`；同一响应内各项的 `expires_at` 相同。
+- 启用心跳的领取项额外含 `last_heartbeat_at`（初值等于领取时刻 `claimed_at`）与 `heartbeat_deadline_at`（等于 `last_heartbeat_at` 加 `heartbeat_seconds`，且不晚于 `expires_at`）；未启用心跳的领取项不含任何心跳字段。
 - 当前时间达到 `expires_at` 时租约失效：实例仍为 `pending`，不产生结果、时长或覆盖率，随后可被任意工作进程再次领取（新领取生成新的 `claim_id`），也可按下方无租约规则直接提交。
 - 运行不存在返回 404 `run_not_found`；已完成运行返回 409 `run_completed`。请求体不是对象、含未知字段、字段类型或取值不合规返回 400 `validation_error`；畸形 JSON 返回 400 `invalid_json`。
 
@@ -100,11 +102,29 @@ PYTHONPATH=src python3 -m testlattice.server --host 127.0.0.1 --port 8080
 - 使用过期、已消费、未知或属于其他实例且已失效的标识返回 409 `claim_not_active`；任何冲突或失效失败都不写入结果或覆盖率。
 - 提交成功时在同一原子步骤内消费租约并沿用既有规则写入 `outcome`、`duration_ms`、`details`、`coverage`，重复结果与完成规则不变；被消费的 `claim_id` 不可再次使用（再次提交为 409 `claim_not_active`）。
 - 实例无有效租约且未提供 `claim_id` 时，保留原有的直接提交行为；实例无有效租约却提供 `claim_id` 返回 409 `claim_not_active`。
+- 启用心跳的租约在 `heartbeat_deadline_at` 之后、硬超时（`expires_at` 与冻结 `timeout_seconds`）之前进入失联状态：实例仍为 `pending`，租约不失效、不可重领、资源继续占用；此时无论是否携带该 `claim_id`，结果提交均返回 409 `heartbeat_expired`。
 - 运行报告、跨运行聚合、JUnit XML、覆盖率与诊断导出、完成与重试响应均不增加任何租约字段；租约中的实例仍计入 `pending`，未完成结果前不可 complete。
+
+### 心跳与失联判定
+
+`POST /v1/runs/{run_id}/heartbeats` 让工作进程为活跃领取续期心跳。请求体只允许 `claim_id`（非空字符串）与 `worker_id`（去首尾空白后非空字符串），均必填：
+
+- 领取存在且有效（未消费、硬租约未失效）、`worker_id` 与领取时一致、且未启用心跳时——未启用心跳返回 409 `heartbeat_not_enabled`；`worker_id` 不匹配返回 409 `claim_conflict`；未知、已消费或租约已按 `expires_at` 正常失效返回 409 `claim_not_active`；当前时间已达到 `heartbeat_deadline_at` 返回 409 `heartbeat_expired`。
+- 成功时按当前纪元毫秒更新 `last_heartbeat_at`，并令 `heartbeat_deadline_at` 为当前时间加原 `heartbeat_seconds` 与 `expires_at` 的较早值，返回更新后的领取视图；不延长 `expires_at`（硬租约），也不延长冻结 `timeout_seconds`（硬超时）。
+- 运行不存在返回 404 `run_not_found`；运行已完成返回 409 `run_completed`；畸形 JSON 返回 400 `invalid_json`；请求体不是对象、缺字段、含未知字段或字段类型不合规返回 400 `validation_error`。失败不改变任何状态。
+
+`POST /v1/runs/{run_id}/hangs` 由平台判定失联实例。请求体必须是空 JSON 对象；判定在服务锁内对开放运行原子完成，仅处理持有心跳租约且 `heartbeat_deadline_at` 已到、但硬租约 `expires_at` 未到的 pending 实例：
+
+- 响应 200 为 `{"hung": [...], "run": {...}}`：`hung` 按冻结顺序列出本次新判定失联的 `instance_id`，无命中时为空数组；`run` 为完整运行报告。
+- 命中项在同一原子步骤内消费租约并写入结果：`outcome` 为 `error`，`duration_ms` 为 `max(0, detected_at - claimed_at)`，`details` 固定含 `code`（`hung`）、`worker_id`、`claimed_at`、`last_heartbeat_at`、`heartbeat_deadline_at` 与 `detected_at`，各时间均为纪元毫秒整数。失联结果不含覆盖率，判定后释放所占资源，但不自动完成运行。
+- 心跳逾期与冻结硬超时同时达到（当前时间达到 `claimed_at + timeout_seconds`）时，沿用现有 `timeout` 结果及其 `details` 结构，该实例不列入 `hung`；该优先关系在 `/timeouts` 与 `/hangs` 两个入口一致。
+- 结果提交、失联判定与超时判定并发时同一实例只有一个转换成功；失联判定先成功后，携带原 `claim_id` 的迟到心跳与提交均返回 409 `claim_not_active`，且不覆盖结果。
+- 失联结果纳入现有 `summary`、JUnit XML、诊断导出、跨运行聚合与默认失败重试（`error` outcome）。
+- 运行不存在返回 404 `run_not_found`；运行已完成返回 409 `run_completed`；畸形 JSON 返回 400 `invalid_json`；请求体不是对象或含字段返回 400 `validation_error`。所有失败都不改变实例、租约或覆盖率。
 
 ### 占用超时判定
 
-`POST /v1/runs/{run_id}/timeouts` 由平台判定占用中的超时实例。请求体必须是空 JSON 对象；判定在服务锁内对开放运行原子完成：仅当 pending 实例持有有效租约（未消费且未按 `expires_at` 失效），且服务端当前时间达到 `claimed_at`（领取时的纪元毫秒）加冻结 `timeout_seconds` 时才判定超时。已有结果、无租约、已消费或已按 `expires_at` 失效的租约均不处理——失效租约仍只让实例保持 `pending` 并可再次领取。
+`POST /v1/runs/{run_id}/timeouts` 由平台判定占用中的超时实例。请求体必须是空 JSON 对象；判定在服务锁内对开放运行原子完成：仅当 pending 实例持有有效租约（未消费且未按 `expires_at` 失效），且服务端当前时间达到 `claimed_at`（领取时的纪元毫秒）加冻结 `timeout_seconds` 时才判定超时。已有结果、无租约、已消费或已按 `expires_at` 失效的租约均不处理——失效租约仍只让实例保持 `pending` 并可再次领取。心跳已逾期（`heartbeat_deadline_at` 已到）但硬超时未到的租约同样不处理，实例保持 `pending` 且不可重领；一旦硬超时也达到，则按下方既有超时结果处理而不是失联。
 
 - 响应 200 为 `{"timed_out": [...], "run": {...}}`：`timed_out` 按冻结顺序列出本次新超时的 `instance_id`，无命中时为空数组；`run` 为完整运行报告。
 - 命中实例在同一原子步骤内消费租约并写入结果：`outcome` 为 `error`，`duration_ms` 为冻结 `timeout_seconds` 乘 1000，`details` 固定含 `code`（`timeout`）、`timeout_seconds`、`worker_id`、`claimed_at`、`deadline_at`（等于 `claimed_at` 加超时毫秒）与 `detected_at`（本次检查时间），三个时间均为纪元毫秒整数。超时结果不含覆盖率，也不自动完成运行。
